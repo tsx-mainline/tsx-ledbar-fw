@@ -17,14 +17,14 @@ stopped while the flash runs and started again at the end.
   tsx-ledbar-flash console CMD...      one application console command
   tsx-ledbar-flash enter-bootloader    send the prepare packet only
   tsx-ledbar-flash btl-read [MS]       read bootloader packets for MS ms
-  tsx-ledbar-flash power-cycle         cut the USB port power for 3 s
+  tsx-ledbar-flash port-reset          disable the USB port for 3 s, enable it
 
-power-cycle: the panel switches VBUS of the bar's port (a regulator on
-the USB host port), so the bar restarts from its bootloader as after a
-power-up. This is the recovery when the bar sits in a mode that does not
-answer on USB. The bootloader keeps an image only when its CRC is good,
-so a bar with an interrupted load starts in bootloader mode again and
-takes a new load.
+port-reset: a USB bus reset of the bar's port. It does not cut the bar's
+supply (the panel keeps VBUS on), but a bar left in a mode that does not
+answer on USB came back to its application after it. The bootloader
+keeps an image only when its CRC is good, so a bar with an interrupted
+load starts in bootloader mode again and takes a new load. A real power
+cycle needs a power cycle of the panel.
 """
 import ctypes
 import errno
@@ -237,18 +237,18 @@ def port_disable_path(bar=None):
     return None
 
 
-def power_cycle(bar=None, off_s=3.0):
+def port_reset(bar=None, off_s=3.0):
     p = port_disable_path(bar)
     if p is None:
         die('no USB port power control found')
-    log('USB port power off (%s)' % p)
+    log('USB port disabled (%s)' % p)
     with open(p, 'w') as f:
         f.write('1')
     time.sleep(off_s)
-    log('USB port power on')
+    log('USB port enabled')
     with open(p, 'w') as f:
         f.write('0')
-    return wait_for(lambda b: True, 20, 'the bar after the power cycle')
+    return wait_for(lambda b: True, 20, 'the bar after the port reset')
 
 
 # ---- service ----------------------------------------------------------------
@@ -476,10 +476,10 @@ def cmd_enter(args):
     log('bootloader on %s as 14be:%s' % (bar.sysname, bar.pid))
 
 
-def cmd_power_cycle(args):
-    bar = power_cycle(Bar.find())
+def cmd_port_reset(args):
+    bar = port_reset(Bar.find())
     if bar is None:
-        die('the bar did not come back after the power cycle')
+        die('the bar did not come back after the port reset')
     bar.open(0)
     try:
         log('bar %s up as 14be:%s, string 4 "%s"' % (bar.sysname, bar.pid, bar.string(4)))
@@ -553,7 +553,7 @@ def main():
     a = sub.add_parser('console'); a.add_argument('line', nargs='+'); a.add_argument('--ms', type=int, default=1500)
     a = sub.add_parser('btl-read'); a.add_argument('ms', type=int, nargs='?', default=3000)
     sub.add_parser('enter-bootloader')
-    sub.add_parser('power-cycle')
+    sub.add_parser('port-reset')
     args = p.parse_args()
     if os.geteuid() != 0:
         die('run as root (usbdevfs)')
@@ -567,8 +567,8 @@ def main():
         cmd_btl_read(args)
     elif args.cmd == 'enter-bootloader':
         cmd_enter(args)
-    elif args.cmd == 'power-cycle':
-        cmd_power_cycle(args)
+    elif args.cmd == 'port-reset':
+        cmd_port_reset(args)
 
 
 if __name__ == '__main__':
