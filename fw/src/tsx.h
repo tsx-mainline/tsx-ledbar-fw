@@ -85,6 +85,7 @@ unsigned leds_get_cap(void);
 void usb_init(void);
 void usb_poll(void);
 bool usb_configured(void);
+void usb_debug_state(uint32_t v[7]);	/* DIEPCTL1, DIEPINT1, DIEPTSIZ1, GINTSTS, DAINT, console head, tail */
 /* console (interface 0) text out, Cresnet (interface 1) packets out */
 void console_write(const char *s);
 void console_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

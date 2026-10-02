@@ -25,6 +25,7 @@
 #define TYPE_DOWNLOAD	0x04
 #define SUB_PREPARE	0x04
 #define TYPE_ANALOG	0x14
+#define TYPE_DEBUG	0x7F	/* answer: USB and console state, for bring-up */
 #define JOIN_BLINK0	0
 #define JOIN_LEVEL0	3
 
@@ -67,6 +68,23 @@ void cresnet_rx(const uint8_t *data, size_t n)
 		}
 		send_state = true;
 		break;
+	case TYPE_DEBUG: {
+		uint8_t pkt[2 + 1 + 4 * 7];
+		uint32_t v[7];
+
+		usb_debug_state(v);
+		pkt[0] = 0x02;
+		pkt[1] = (uint8_t)(sizeof(pkt) - 2);
+		pkt[2] = TYPE_DEBUG;
+		for (int i = 0; i < 7; i++) {
+			pkt[3 + 4 * i] = (uint8_t)(v[i] >> 24);
+			pkt[4 + 4 * i] = (uint8_t)(v[i] >> 16);
+			pkt[5 + 4 * i] = (uint8_t)(v[i] >> 8);
+			pkt[6 + 4 * i] = (uint8_t)v[i];
+		}
+		cresnet_send(pkt, sizeof(pkt));
+		break;
+	}
 	case TYPE_DOWNLOAD:
 		if (len >= 2 && data[3] == SUB_PREPARE) {
 			delay_ms(50);	/* let the transfer finish on the bus */

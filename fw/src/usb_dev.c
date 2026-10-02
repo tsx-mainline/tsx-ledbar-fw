@@ -224,6 +224,24 @@ static void reset_cb(void)
 	configured = false;
 }
 
+/*
+ * SET_INTERFACE: the Linux host sends it when a userland program
+ * releases an interface (usbfs, libusb), and then starts its data
+ * toggles at DATA0 again. The core must do the same, or every second
+ * packet of the interface is dropped as a repeat.
+ */
+static void altsetting_cb(usbd_device *d, uint16_t wIndex, uint16_t wValue)
+{
+	uint8_t ep = wIndex == 0 ? 1 : 2;
+
+	(void)d;
+	(void)wValue;
+	if (wIndex > 1)
+		return;
+	OTG_FS_DIEPCTL(ep) |= OTG_DIEPCTLX_SD0PID;
+	OTG_FS_DOEPCTL(ep) |= OTG_DOEPCTLX_SD0PID;
+}
+
 void usb_init(void)
 {
 	gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO11 | GPIO12);
@@ -236,29 +254,141 @@ void usb_init(void)
 	OTG_FS_GCCFG |= OTG_GCCFG_NOVBUSSENS;
 	usbd_register_set_config_callback(dev, set_config_cb);
 	usbd_register_reset_callback(dev, reset_cb);
+	usbd_register_set_altsetting_callback(dev, altsetting_cb);
 }
+
+/*
+ * IN endpoint arming. The dwc core needs care here:
+ *
+ * 1. The poll loop of the library writes SNAK after each completed
+ *    packet. A CNAK written before that NAK took effect is lost, and
+ *    the endpoint then NAKs every IN token with EPENA set: stuck. So a
+ *    new packet is armed only when EPENA is clear and NAKSTS reads 1.
+ * 2. The library's write function handles a still-enabled endpoint with
+ *    unbounded waits on the core, which never end while the host does
+ *    not poll. The check happens here instead, with bounded waits.
+ * 3. Should an endpoint still get stuck (EPENA and NAKSTS for more than
+ *    IN_STUCK_MS), it is disabled, its FIFO flushed, and the last packet
+ *    is sent again. A copy of the last packet is kept for that.
+ */
+#define IN_STUCK_MS	2000
+
+struct in_ep {
+	uint8_t last[EP_SIZE];
+	uint8_t last_len;
+	uint32_t stuck_since;
+	bool stuck_seen;
+};
+
+static struct in_ep in_eps[3];	/* index = endpoint number */
+
+static bool wait_bit(volatile uint32_t *reg, uint32_t mask, bool set, uint32_t ms)
+{
+	uint32_t start = millis();
+
+	while (((*reg & mask) != 0) != set) {
+		if (millis() - start > ms)
+			return false;
+		guard_kick();
+	}
+	return true;
+}
+
+static void ep_in_recover(uint8_t ep)
+{
+	uint32_t fifo = (OTG_FS_DIEPCTL(ep) & OTG_DIEPCTL0_TXFNUM_MASK) >> 22;
+
+	OTG_FS_DIEPCTL(ep) |= OTG_DIEPCTL0_SNAK;
+	wait_bit(&OTG_FS_DIEPINT(ep), OTG_DIEPINTX_INEPNE, true, 2);
+	OTG_FS_DIEPCTL(ep) |= OTG_DIEPCTL0_EPDIS | OTG_DIEPCTL0_SNAK;
+	wait_bit(&OTG_FS_DIEPINT(ep), OTG_DIEPINTX_EPDISD, true, 2);
+	OTG_FS_DIEPINT(ep) = OTG_DIEPINTX_EPDISD | OTG_DIEPINTX_INEPNE;
+	wait_bit(&OTG_FS_GRSTCTL, OTG_GRSTCTL_AHBIDL, true, 2);
+	OTG_FS_GRSTCTL = (fifo << 6) | OTG_GRSTCTL_TXFFLSH;
+	wait_bit(&OTG_FS_GRSTCTL, OTG_GRSTCTL_TXFFLSH, false, 2);
+	errlog_add(ERR_USB, ep);
+}
+
+/* true when a packet may be armed now; handles a stuck endpoint */
+static bool ep_in_ready(uint8_t addr)
+{
+	uint8_t ep = addr & 0x7F;
+	struct in_ep *e = &in_eps[ep];
+	uint32_t ctl = OTG_FS_DIEPCTL(ep);
+
+	if (!(ctl & OTG_DIEPCTL0_EPENA)) {
+		e->stuck_seen = false;
+		return (ctl & OTG_DIEPCTL0_NAKSTS) != 0;
+	}
+	if (!(ctl & OTG_DIEPCTL0_NAKSTS)) {
+		e->stuck_seen = false;	/* packet in flight */
+		return false;
+	}
+	if (!e->stuck_seen) {
+		e->stuck_seen = true;
+		e->stuck_since = millis();
+		return false;
+	}
+	if (millis() - e->stuck_since < IN_STUCK_MS)
+		return false;
+	ep_in_recover(ep);
+	e->stuck_seen = false;
+	if (e->last_len && (OTG_FS_DIEPCTL(ep) & OTG_DIEPCTL0_NAKSTS))
+		usbd_ep_write_packet(dev, addr, e->last, e->last_len);
+	return false;
+}
+
+static bool ep_in_send(uint8_t addr, const uint8_t *buf, unsigned n)
+{
+	struct in_ep *e = &in_eps[addr & 0x7F];
+
+	if (usbd_ep_write_packet(dev, addr, buf, (uint16_t)n) != n)
+		return false;
+	memcpy(e->last, buf, n);
+	e->last_len = (uint8_t)n;
+	return true;
+}
+
+/*
+ * Console answers go out in packets of at most 63 bytes. Every packet is
+ * then a short packet, and a host read of any size returns at once: the
+ * stock tools read 512 bytes with a timeout and drop what a timed-out
+ * read had collected.
+ */
+#define CONSOLE_CHUNK	(EP_SIZE - 1)
 
 static void pump_console(void)
 {
 	uint8_t buf[EP_SIZE];
 	unsigned n = 0, tail = console_tail;
 
-	while (n < EP_SIZE && tail != console_head) {
+	if (tail == console_head || !ep_in_ready(EP_CONSOLE_IN))
+		return;
+	while (n < CONSOLE_CHUNK && tail != console_head) {
 		buf[n++] = console_ring[tail];
 		tail = (tail + 1) % CONSOLE_RING;
 	}
-	if (n == 0)
-		return;
-	if (usbd_ep_write_packet(dev, EP_CONSOLE_IN, buf, (uint16_t)n) == n)
+	if (ep_in_send(EP_CONSOLE_IN, buf, n))
 		console_tail = tail;
 }
 
 static void pump_io(void)
 {
-	if (io_tail == io_head)
+	if (io_tail == io_head || !ep_in_ready(EP_IO_IN))
 		return;
-	if (usbd_ep_write_packet(dev, EP_IO_IN, io_queue[io_tail], io_len[io_tail]) == io_len[io_tail])
+	if (ep_in_send(EP_IO_IN, io_queue[io_tail], io_len[io_tail]))
 		io_tail = (io_tail + 1) % IO_QUEUE;
+}
+
+void usb_debug_state(uint32_t v[7])
+{
+	v[0] = OTG_FS_DIEPCTL(1);
+	v[1] = OTG_FS_DIEPINT(1);
+	v[2] = OTG_FS_DIEPTSIZ(1);
+	v[3] = OTG_FS_GINTSTS;
+	v[4] = OTG_FS_DAINT;
+	v[5] = console_head;
+	v[6] = console_tail;
 }
 
 void usb_poll(void)
@@ -275,6 +405,12 @@ void usb_poll(void)
 void usb_init(void)
 {
 	configured = true;
+}
+
+void usb_debug_state(uint32_t v[7])
+{
+	for (int i = 0; i < 7; i++)
+		v[i] = 0;
 }
 
 void usb_poll(void)
