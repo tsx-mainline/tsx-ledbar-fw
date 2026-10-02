@@ -7,7 +7,7 @@ STM32F205) and check the console, the LED engine and the start guard.
 
 The QEMU build has no USB and no I2C model: the console runs on USART1
 and the LED driver registers are kept in RAM. TRACE ON prints one line
-"led MS R G B" (duties) after each engine tick that changed a duty.
+"led MS R G B" (duties) after each engine tick.
 """
 import os
 import re
@@ -75,7 +75,8 @@ class Machine:
 
 
 def leds_in(text):
-    return [tuple(int(x) for x in m) for m in re.findall(r'led (\d+) (\d+) (\d+) (\d+)', text)]
+    # complete lines only: a read can end in the middle of a trace line
+    return [tuple(int(x) for x in m) for m in re.findall(r'led (\d+) (\d+) (\d+) (\d+)\r?\n', text)]
 
 
 def main():
