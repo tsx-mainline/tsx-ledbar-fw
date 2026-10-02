@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * LED engine. It runs every 10 ms and writes one GRPPWM byte per color
- * when the duty of that color changed (three short I2C writes at most).
+ * LED engine. It runs every 10 ms and writes the brightness of a color
+ * (PWMx and GRPPWM, see tlc_set_dim) only when its duty changed.
  *
  * Host model (as the stock firmware): a color lights while its digital
  * join is on, at its analog join level 0..100. A blink time (analog joins

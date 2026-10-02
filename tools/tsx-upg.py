@@ -21,7 +21,7 @@ Commands:
   verify FILE.upg             exit 1 when a check fails
   unpack FILE.upg OUT.bin     write the flash bytes (gaps filled with 0xFF)
   pack IN.bin OUT.upg         fill the header, write the S-record text
-      [--base 0x08020000] [--product 0xE5] [--version 0.1.0]
+      [--base 0x08020000] [--product 0xE5] [--version MAJOR.MINOR.BUILD]
 """
 import argparse
 import struct
