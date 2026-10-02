@@ -115,9 +115,15 @@ static void cmd_status(void)
 		       s->level[0], s->level[1], s->level[2],
 		       s->control[0], s->control[1], s->control[2],
 		       s->blink_100ms[0], s->blink_100ms[1], s->blink_100ms[2]);
+	uint8_t pwm[NCOLORS], grp[NCOLORS];
+
+	for (int c = 0; c < NCOLORS; c++)
+		tlc_get_dim(c, &pwm[c], &grp[c]);
 	console_printf("duty %u %u %u fx %s smooth %lu ms cap %u%%\r\n",
 		       s->duty[0], s->duty[1], s->duty[2], leds_fx_name(),
 		       (unsigned long)leds_get_smooth(), leds_get_cap());
+	console_printf("pwm:grp %u:%u %u:%u %u:%u (duty of 65535)\r\n",
+		       pwm[0], grp[0], pwm[1], grp[1], pwm[2], grp[2]);
 	console_printf("chips %s %s %s uptime %lu ms start %lu reset flags 0x%08lX errors %d\r\n",
 		       tlc_ready(RED) ? "ok" : "BAD", tlc_ready(GREEN) ? "ok" : "BAD",
 		       tlc_ready(BLUE) ? "ok" : "BAD", (unsigned long)millis(),

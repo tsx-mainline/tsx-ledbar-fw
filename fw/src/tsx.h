@@ -8,8 +8,8 @@
 
 #define TSX_VERSION_MAJOR	0
 #define TSX_VERSION_MINOR	1
-#define TSX_VERSION_BUILD	0
-#define TSX_VERSION_STR		"0.1.0"
+#define TSX_VERSION_BUILD	1
+#define TSX_VERSION_STR		"0.1.1"
 /* USB string 4 and the VER command: the host tools look for "TSX-LEDBAR" */
 #define TSX_FW_NAME		"TSX-LEDBAR [v" TSX_VERSION_STR "]"
 #define TSX_PRODUCT_CODE	0xE5
@@ -48,6 +48,8 @@ bool tlc_ready(int color);
 bool tlc_write(int color, uint8_t reg, const uint8_t *data, size_t n);
 bool tlc_read(int color, uint8_t reg, uint8_t *data, size_t n);
 bool tlc_set_group_pwm(int color, uint8_t duty);
+bool tlc_set_dim(int color, uint8_t pwm, uint8_t grp);	/* brightness PWM x GRPPWM */
+void tlc_get_dim(int color, uint8_t *pwm, uint8_t *grp);
 bool tlc_set_group_blink(int color, bool blink, uint8_t freq);
 bool tlc_set_out_mode(int color, int out, int mode);	/* out 0..15 or -1 = all */
 bool tlc_set_pwm(int color, int out, uint8_t duty);
@@ -59,7 +61,7 @@ struct led_state {
 	uint8_t level[NCOLORS];		/* host level 0..100 (analog join) */
 	bool control[NCOLORS];		/* host switch (digital join) */
 	uint16_t blink_100ms[NCOLORS];	/* stock blink time, 100 ms units */
-	uint8_t duty[NCOLORS];		/* last duty sent to the chips */
+	uint16_t duty[NCOLORS];		/* last duty sent, 0..65535 of full */
 };
 void leds_init(void);
 void leds_tick(void);			/* run every ms from the main loop */

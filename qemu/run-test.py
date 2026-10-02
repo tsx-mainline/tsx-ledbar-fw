@@ -107,13 +107,13 @@ def main():
         m.cmd('LED RED LEVEL 100')
         out = m.cmd('LED RED CONTROL 1', 0.8)
         leds = leds_in(out)
-        check(leds and leds[-1][1:] == (255, 0, 0), 'red at level 100 gives duty 255 0 0: %s' % (leds[-1:],))
+        check(leds and leds[-1][1:] == (65535, 0, 0), 'red at level 100 gives duty 65535 0 0: %s' % (leds[-1:],))
 
-        # the power cap: red and green at 100 -> both scaled to 140 (110 % of 255 total)
+        # the power cap: red and green at 100 -> both scaled to 36044 (110 % of one channel)
         m.cmd('LED GREEN LEVEL 100')
         out = m.cmd('LED GREEN CONTROL 1', 0.8)
         leds = leds_in(out)
-        check(leds and leds[-1][1:] == (140, 140, 0), 'power cap keeps red+green at 140 140 0: %s' % (leds[-1:],))
+        check(leds and leds[-1][1:] == (36044, 36044, 0), 'power cap keeps red+green at 36044 36044 0: %s' % (leds[-1:],))
 
         # a smoothed host change ramps the blue channel up over about 500 ms
         m.cmd('FX SMOOTH 500')
@@ -122,7 +122,7 @@ def main():
         leds = leds_in(out)
         blues = [l[3] for l in leds]
         check(len(blues) >= 10 and blues == sorted(blues), 'smooth ramp: %d steps, rising' % len(blues))
-        check(leds and leds[-1][1:] == (93, 93, 93), 'three colors at 100 end at 93 93 93 (cap): %s' % (leds[-1:],))
+        check(leds and leds[-1][1:] == (24029, 24029, 24029), 'three colors at 100 end at 24029 each (cap): %s' % (leds[-1:],))
 
         # a fade effect to black over 300 ms, then the host color comes back with FX OFF
         m.cmd('FX SMOOTH 0')
@@ -131,17 +131,33 @@ def main():
         check(leds and leds[-1][1:] == (0, 0, 0) and len(leds) >= 10, 'FX FADE reaches black in steps: %d steps' % len(leds))
         out = m.cmd('FX OFF', 0.8)
         leds = leds_in(out)
-        check(leds and leds[-1][1:] == (93, 93, 93), 'FX OFF restores the host color: %s' % (leds[-1:],))
+        check(leds and leds[-1][1:] == (24029, 24029, 24029), 'FX OFF restores the host color: %s' % (leds[-1:],))
 
         out = m.cmd('FX RAINBOW 1000 50', 1.2)
         leds = leds_in(out)
         check(len(leds) >= 20 and len(set(l[1:] for l in leds)) >= 20, 'rainbow changes the color: %d steps' % len(leds))
         out = m.cmd('FX BLINK 100 0 0 200 200', 1.0)
         leds = leds_in(out)
-        check((255, 0, 0) in [l[1:] for l in leds] and (0, 0, 0) in [l[1:] for l in leds], 'blink toggles red')
+        check((65535, 0, 0) in [l[1:] for l in leds] and (0, 0, 0) in [l[1:] for l in leds], 'blink toggles red')
         out = m.cmd('LED RED LEVEL 10', 0.8)
         check('fx off' in m.cmd('FX') or True, 'a host join ends the effect')
-        check(leds_in(out) and leds_in(out)[-1][1:] == (1, 139, 139), 'host color after the join, capped: %s' % (leds_in(out)[-1:],))
+        check(leds_in(out) and leds_in(out)[-1][1:] == (403, 35842, 35842), 'host color after the join, capped: %s' % (leds_in(out)[-1:],))
+
+        # breathe: no jump and no long dwell at the bottom of the wave
+        m.cmd('LED RED CONTROL 0'); m.cmd('LED GREEN CONTROL 0'); m.cmd('LED BLUE CONTROL 0', 0.5)
+        out = m.cmd('FX BREATHE 100 0 0 2000', 4.5)
+        reds = [l[1] for l in leds_in(out)]
+        low = [r for r in reds if 0 < r < 1000]
+        first = min([r for r in reds if r > 0], default=None)
+        steps = [abs(b - a) for a, b in zip(reds, reds[1:]) if min(a, b) < 1000]
+        check(first is not None and first < 50, 'breathe: first step above off is tiny (%s of 65535)' % first)
+        check(steps and max(steps) < 300, 'breathe: steps near the bottom stay small (max %s)' % (max(steps) if steps else None))
+        zeros = sum(1 for r in reds if r == 0)
+        check(zeros <= 6, 'breathe: at most 6 ticks at zero in two periods (%d)' % zeros)
+        check(len(low) >= 4, 'breathe: several distinct ticks below 1000 (%d)' % len(low))
+        out = m.cmd('STATUS')
+        check(re.search(r'pwm:grp \d+:\d+', out) is not None, 'STATUS shows the PWM and group values')
+        m.cmd('FX OFF')
         m.cmd('TRACE OFF')
 
         # the guard: three starts without "USB configured" (never in QEMU),

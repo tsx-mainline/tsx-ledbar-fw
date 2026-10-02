@@ -12,11 +12,15 @@
  * sends a new join. FADE goes to a color over a time and holds it. BLINK,
  * BREATHE and RAINBOW repeat until they are stopped.
  *
- * Color math: a level 0..100 maps to a duty 0..255 with a gamma-2 curve,
- * so a linear fade in level looks linear. Ramps and effects work in
- * level units with 8 fraction bits. A power cap keeps the sum of the
- * three duties at or below "cap" percent of one full channel (default
- * 110, the total the stock firmware allows).
+ * Color math: a level 0..100 is a lightness. It maps to a duty 0..65535
+ * of full brightness with the CIE 1976 lightness curve, so a linear fade
+ * in level looks linear, and the curve is linear near zero, so a fade
+ * does not dwell at the bottom. Ramps and effects work in level units
+ * with 8 fraction bits, and the duty is interpolated between the table
+ * entries. The duty goes to the chips as PWMx x GRPPWM (tlc_set_dim),
+ * so the lowest step is 1/65025 of full brightness. A power cap keeps the
+ * sum of the three duties at or below "cap" percent of one full channel
+ * (default 110, the total the stock firmware allows).
  */
 #include <string.h>
 #include "tsx.h"
@@ -40,10 +44,23 @@ static enum fx fx;
 static uint8_t fx_rgb[NCOLORS];
 static uint32_t fx_t0, fx_a, fx_b;
 static uint8_t fx_level;
-static uint8_t direct_duty[NCOLORS];
+static uint16_t direct_duty[NCOLORS];
 static uint32_t last_tick;
 
-static uint8_t gamma_table[101];
+/* CIE 1976: Y = L / 903.3 for L <= 8, else ((L + 16) / 116)^3, x 65535 */
+static const uint16_t cie_table[101] = {
+	0, 73, 145, 218, 290, 363, 435, 508, 580, 656,
+	738, 826, 922, 1024, 1134, 1251, 1376, 1509, 1650, 1800,
+	1959, 2127, 2304, 2491, 2687, 2894, 3111, 3338, 3576, 3826,
+	4087, 4359, 4643, 4940, 5248, 5569, 5903, 6251, 6611, 6985,
+	7373, 7775, 8192, 8623, 9069, 9530, 10006, 10498, 11006, 11530,
+	12071, 12628, 13202, 13793, 14401, 15027, 15671, 16333, 17014, 17713,
+	18431, 19168, 19924, 20700, 21497, 22313, 23149, 24007, 24885, 25784,
+	26705, 27648, 28612, 29598, 30607, 31639, 32694, 33771, 34872, 35997,
+	37146, 38319, 39516, 40738, 41986, 43258, 44555, 45879, 47228, 48603,
+	50005, 51434, 52890, 54372, 55883, 57421, 58987, 60581, 62203, 63855,
+	65535,
+};
 
 #ifdef TSX_QEMU
 #include <stdio.h>
@@ -55,30 +72,55 @@ static int32_t clamp(int32_t v, int32_t lo, int32_t hi)
 	return v < lo ? lo : v > hi ? hi : v;
 }
 
-/* level in FP units to duty, with interpolation between table entries */
-static uint8_t level_to_duty(int32_t lvl)
+/* level in FP units to a duty 0..65535, interpolated between entries */
+static uint32_t level_to_duty(int32_t lvl)
 {
 	int32_t i, f, a, b;
 
 	lvl = clamp(lvl, 0, LEVEL_MAX);
 	i = lvl / FP;
 	f = lvl % FP;
-	a = gamma_table[i];
-	b = gamma_table[i < 100 ? i + 1 : 100];
-	return (uint8_t)(a + ((b - a) * f) / FP);
+	a = cie_table[i];
+	b = cie_table[i < 100 ? i + 1 : 100];
+	return (uint32_t)(a + ((b - a) * f) / FP);
 }
 
-/* 0..255 -> 0..255, half a cosine wave: 0 at 0, 255 at 128, 0 at 255 */
+/*
+ * Breathe: phase 0..4095 over one period. 0..2047 rises, 2048..4095
+ * falls. Half a cosine wave from a 33-entry table, 0..65535.
+ */
+#define BREATHE_STEPS	4096
+
 static uint32_t breathe_curve(uint32_t phase)
 {
-	static const uint8_t quarter[33] = {
-		0, 1, 2, 6, 10, 15, 22, 30, 39, 49, 60, 71, 83, 96, 109, 123,
-		137, 150, 164, 177, 189, 201, 212, 222, 231, 238, 245, 250,
-		253, 255, 255, 255, 255 };
-	uint32_t p = phase & 0xFF;
-	uint32_t i = (p < 128 ? p : 255 - p) / 4;	/* 0..31 */
+	static const uint16_t half_cos[33] = {
+	0, 158, 630, 1411, 2494, 3869, 5522, 7438, 9597, 11980, 14563,
+	17321, 20228, 23256, 26375, 29556, 32767, 35979, 39160, 42279, 45307, 48214,
+	50972, 53555, 55938, 58097, 60013, 61666, 63041, 64124, 64905, 65377, 65535,
+	};
+	uint32_t p = phase % BREATHE_STEPS;
+	uint32_t x = p < BREATHE_STEPS / 2 ? p : BREATHE_STEPS - 1 - p;	/* 0..2047 */
+	uint32_t i = x / 64, f = x % 64;					/* 0..31 */
 
-	return quarter[i] + (quarter[i + 1] - quarter[i]) * ((p < 128 ? p : 255 - p) % 4) / 4;
+	return half_cos[i] + (uint32_t)((int32_t)(half_cos[i + 1] - half_cos[i]) * (int32_t)f / 64);
+}
+
+/*
+ * Duty 0..65535 to PWMx x GRPPWM. The target t is in units of 1/65025
+ * (255 x 255). GRPPWM is the smallest value that still reaches t with
+ * PWMx <= 255, so PWMx stays in 128..255 above the bottom and the
+ * rounding error stays below 0.4 % of the duty.
+ */
+static void duty_split(uint32_t duty, uint8_t *pwm, uint8_t *grp)
+{
+	uint32_t t = (duty * 65025U + 32767U) / 65535U, g, p;
+
+	if (t == 0)
+		t = 1;
+	g = (t + 254) / 255;
+	p = (t + g / 2) / g;
+	*grp = (uint8_t)g;
+	*pwm = (uint8_t)(p > 255 ? 255 : p == 0 ? 1 : p);
 }
 
 /* hue 0..1535 (6 x 256), full saturation, value = level */
@@ -102,13 +144,6 @@ static void hue_to_rgb(uint32_t hue, uint8_t level, int32_t out[NCOLORS])
 
 void leds_init(void)
 {
-	for (int l = 0; l <= 100; l++) {
-		uint32_t d = (l * l * 255 + 5000) / 10000;
-
-		if (l > 0 && d == 0)
-			d = 1;
-		gamma_table[l] = (uint8_t)d;
-	}
 	memset(&st, 0, sizeof(st));
 	fx = FX_NONE;
 	tlc_init();
@@ -151,7 +186,9 @@ static void run_ramp(void)
 
 static void apply(void)
 {
-	uint32_t duty[NCOLORS], sum = 0, cap = cap_percent * 255 / 100;
+	uint32_t duty[NCOLORS], sum = 0, cap = cap_percent * 65535U / 100U;
+	uint8_t pwm, grp;
+	bool ok;
 
 	for (int c = 0; c < NCOLORS; c++) {
 		duty[c] = fx == FX_DIRECT ? direct_duty[c] : level_to_duty(cur[c]);
@@ -159,13 +196,19 @@ static void apply(void)
 	}
 	if (sum > cap) {
 		for (int c = 0; c < NCOLORS; c++)
-			duty[c] = duty[c] * cap / sum;
+			duty[c] = (uint32_t)((uint64_t)duty[c] * cap / sum);
 	}
 	for (int c = 0; c < NCOLORS; c++) {
 		if (duty[c] == st.duty[c])
 			continue;
-		if (tlc_set_group_pwm(c, (uint8_t)duty[c]))
-			st.duty[c] = (uint8_t)duty[c];
+		if (duty[c] == 0) {
+			ok = tlc_set_group_pwm(c, 0);
+		} else {
+			duty_split(duty[c], &pwm, &grp);
+			ok = tlc_set_dim(c, pwm, grp);
+		}
+		if (ok)
+			st.duty[c] = (uint16_t)duty[c];
 	}
 #ifdef TSX_QEMU
 	if (leds_trace) {
@@ -207,11 +250,11 @@ void leds_tick(void)
 		break;
 	}
 	case FX_BREATHE: {
-		uint32_t phase = (now - fx_t0) % fx_a * 256 / fx_a;
+		uint32_t phase = (uint32_t)((uint64_t)((now - fx_t0) % fx_a) * BREATHE_STEPS / fx_a);
 		uint32_t k = breathe_curve(phase);
 
 		for (int c = 0; c < NCOLORS; c++)
-			cur[c] = (int32_t)(fx_rgb[c] * FP * k / 255);
+			cur[c] = (int32_t)((uint32_t)(fx_rgb[c] * FP) * k / 65535U);
 		break;
 	}
 	case FX_RAINBOW: {
@@ -327,7 +370,7 @@ const char *leds_fx_name(void)
 void leds_direct(const uint8_t rgb[3])
 {
 	for (int c = 0; c < NCOLORS; c++)
-		direct_duty[c] = gamma_table[rgb[c] > 100 ? 100 : rgb[c]];
+		direct_duty[c] = cie_table[rgb[c] > 100 ? 100 : rgb[c]];
 	fx = FX_DIRECT;
 }
 
