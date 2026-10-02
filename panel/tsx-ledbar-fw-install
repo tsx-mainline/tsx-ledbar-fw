@@ -16,7 +16,7 @@ FLASH=${TSX_LEDBAR_FLASH:-tsx-ledbar-flash}
 die() { echo "tsx-ledbar-fw-install: $*" >&2; exit 1; }
 
 bar_firmware() {
-	cat /sys/bus/usb/drivers/leds-crestron-stm32/*/leds/*/firmware 2>/dev/null | head -1
+	cat /sys/class/leds/tsx:rgb:bar/firmware 2>/dev/null
 }
 
 image_version() {
