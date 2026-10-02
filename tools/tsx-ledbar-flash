@@ -66,7 +66,7 @@ def die(msg):
 
 def load_upg_module():
     here = os.path.dirname(os.path.realpath(__file__))
-    for d in (here, '/usr/lib/tsx-ledbar-fw', '/usr/local/lib/tsx-ledbar-fw'):
+    for d in (here, '/usr/local/lib/tsx-ledbar-fw'):
         p = os.path.join(d, 'tsx-upg.py')
         if os.path.exists(p):
             spec = importlib.util.spec_from_file_location('tsx_upg', p)

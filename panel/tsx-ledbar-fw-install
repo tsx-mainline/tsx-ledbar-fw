@@ -12,15 +12,31 @@
 IMAGE=${TSX_LEDBAR_FW_IMAGE:-/usr/share/tsx-ledbar-fw/tsx-ledbar.upg}
 MARKER=${TSX_LEDBAR_FW_MARKER:-/data/tsx/ledbar-fw.installed}
 FLASH=${TSX_LEDBAR_FLASH:-tsx-ledbar-flash}
+LIB=${TSX_LEDBAR_FW_LIB:-/usr/local/lib/tsx-ledbar-fw}
 
 die() { echo "tsx-ledbar-fw-install: $*" >&2; exit 1; }
+
+# tsx-esphome and tsx-voice read the bar firmware name (the effect list) only
+# at start. Restart each one that runs. A failed restart does not fail the
+# flash.
+restart_bar_users() {
+	command -v rc-service >/dev/null 2>&1 || return 0
+	for s in tsx-esphome tsx-voice; do
+		rc-service --exists "$s" 2>/dev/null || continue
+		rc-service "$s" status >/dev/null 2>&1 || continue
+		echo "restarting $s (it reads the bar firmware name at start)"
+		rc-service "$s" restart >/dev/null 2>&1 ||
+			echo "tsx-ledbar-fw-install: $s did not restart. Restart it by hand." >&2
+	done
+	return 0
+}
 
 bar_firmware() {
 	cat /sys/class/leds/tsx:rgb:bar/firmware 2>/dev/null
 }
 
 image_version() {
-	python3 /usr/lib/tsx-ledbar-fw/tsx-upg.py info "$1" | sed -n 's/^ *version *ok *//p'
+	python3 "$LIB"/tsx-upg.py info "$1" | sed -n 's/^ *version *ok *//p'
 }
 
 case $1 in
@@ -40,6 +56,7 @@ esac
 [ "$(id -u)" = 0 ] || die "run as root"
 [ -r "$IMAGE" ] || die "image not found: $IMAGE"
 "$FLASH" flash "$IMAGE" || die "flash failed, the bar keeps its bootloader: run the install again"
+restart_bar_users
 mkdir -p "$(dirname "$MARKER")"
 date '+%F %T' > "$MARKER"
 echo "tsx-ledbar firmware installed. Package upgrades now update the bar."
