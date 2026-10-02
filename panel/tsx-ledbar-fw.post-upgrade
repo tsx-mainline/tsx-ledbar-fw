@@ -1,0 +1,13 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# apk post-upgrade of tsx-ledbar-fw: when the user installed the tsx-ledbar
+# firmware (marker in /data/tsx), load the new packaged image into the bar.
+# Without the marker the bar keeps its firmware (stock by default).
+MARKER=/data/tsx/ledbar-fw.installed
+[ -e "$MARKER" ] || exit 0
+if tsx-ledbar-fw-install --check >/dev/null 2>&1; then
+	exit 0
+fi
+echo "tsx-ledbar-fw: loading the new bar firmware"
+tsx-ledbar-fw-install || echo "tsx-ledbar-fw: the load failed, run tsx-ledbar-fw-install by hand" >&2
+exit 0

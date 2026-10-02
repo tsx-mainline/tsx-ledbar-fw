@@ -1,0 +1,27 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# tsx-ledbar-fw-uninstall: load the stock firmware back into the USB LED bar.
+#
+# The stock image is Crestron software and is not part of any package. The
+# mainline installer keeps the panel's own copy in /data/tsx/vendor/. Give a
+# path when the file is elsewhere:
+#
+#   tsx-ledbar-fw-uninstall [statussign_VERSION.upg]
+STOCK_DIR=${TSX_LEDBAR_STOCK_DIR:-/data/tsx/vendor}
+MARKER=${TSX_LEDBAR_FW_MARKER:-/data/tsx/ledbar-fw.installed}
+FLASH=${TSX_LEDBAR_FLASH:-tsx-ledbar-flash}
+
+die() { echo "tsx-ledbar-fw-uninstall: $*" >&2; exit 1; }
+
+[ "$(id -u)" = 0 ] || die "run as root"
+if [ -n "$1" ]; then
+	IMAGE=$1
+else
+	IMAGE=$(ls "$STOCK_DIR"/statussign_*.upg 2>/dev/null | sort | tail -1)
+	[ -n "$IMAGE" ] || die "no stock image in $STOCK_DIR (statussign_*.upg). Copy it from the panel's stock system (vendor/firmware/) or give its path."
+fi
+[ -r "$IMAGE" ] || die "image not found: $IMAGE"
+python3 /usr/lib/tsx-ledbar-fw/tsx-upg.py verify "$IMAGE" || die "the image fails its checks, nothing sent"
+"$FLASH" flash "$IMAGE" || die "flash failed, the bar keeps its bootloader: run the uninstall again"
+rm -f "$MARKER"
+echo "stock LED bar firmware restored from $IMAGE"

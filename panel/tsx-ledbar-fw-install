@@ -1,0 +1,46 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# tsx-ledbar-fw-install: load the tsx-ledbar firmware into the USB LED bar.
+#
+#   tsx-ledbar-fw-install            load the packaged image
+#   tsx-ledbar-fw-install FILE.upg   load another image
+#   tsx-ledbar-fw-install --check    exit 0 when the bar runs the packaged version
+#
+# The install writes a marker in /data/tsx (ledbar-fw.installed). While the
+# marker exists, a package upgrade loads the new image again. The marker goes
+# away with tsx-ledbar-fw-uninstall, which loads the stock image back.
+IMAGE=${TSX_LEDBAR_FW_IMAGE:-/usr/share/tsx-ledbar-fw/tsx-ledbar.upg}
+MARKER=${TSX_LEDBAR_FW_MARKER:-/data/tsx/ledbar-fw.installed}
+FLASH=${TSX_LEDBAR_FLASH:-tsx-ledbar-flash}
+
+die() { echo "tsx-ledbar-fw-install: $*" >&2; exit 1; }
+
+bar_firmware() {
+	cat /sys/bus/usb/drivers/leds-crestron-stm32/*/leds/*/firmware 2>/dev/null | head -1
+}
+
+image_version() {
+	python3 /usr/lib/tsx-ledbar-fw/tsx-upg.py info "$1" | sed -n 's/^ *version *ok *//p'
+}
+
+case $1 in
+--check)
+	want=$(image_version "$IMAGE") || die "cannot read $IMAGE"
+	have=$(bar_firmware)
+	case $have in
+	*"TSX-LEDBAR [v$want]"*) echo "bar runs tsx-ledbar $want"; exit 0;;
+	"") die "no LED bar found";;
+	*) echo "bar runs \"$have\", package has $want"; exit 1;;
+	esac;;
+"") ;;
+-*) die "usage: tsx-ledbar-fw-install [FILE.upg | --check]";;
+*) IMAGE=$1;;
+esac
+
+[ "$(id -u)" = 0 ] || die "run as root"
+[ -r "$IMAGE" ] || die "image not found: $IMAGE"
+"$FLASH" flash "$IMAGE" || die "flash failed, the bar keeps its bootloader: run the install again"
+mkdir -p "$(dirname "$MARKER")"
+date '+%F %T' > "$MARKER"
+echo "tsx-ledbar firmware installed. Package upgrades now update the bar."
+echo "tsx-ledbar-fw-uninstall puts the stock firmware back."
