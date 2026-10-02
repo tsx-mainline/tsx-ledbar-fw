@@ -436,7 +436,7 @@ def cmd_console(args):
         die('the bar is in bootloader mode')
     bar.open(0)
     try:
-        show_text(bar.command(' '.join(args.cmd), args.ms), '')
+        show_text(bar.command(' '.join(args.line), args.ms), '')
     finally:
         bar.close()
 
@@ -546,7 +546,7 @@ def main():
     sub = p.add_subparsers(dest='cmd', required=True)
     sub.add_parser('info')
     a = sub.add_parser('flash'); a.add_argument('upg')
-    a = sub.add_parser('console'); a.add_argument('cmd', nargs='+'); a.add_argument('--ms', type=int, default=1500)
+    a = sub.add_parser('console'); a.add_argument('line', nargs='+'); a.add_argument('--ms', type=int, default=1500)
     a = sub.add_parser('btl-read'); a.add_argument('ms', type=int, nargs='?', default=3000)
     sub.add_parser('enter-bootloader')
     sub.add_parser('power-cycle')
