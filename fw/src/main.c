@@ -7,8 +7,17 @@
  * (with retries), console, Cresnet, USB. The main loop polls USB, runs
  * the console and Cresnet handlers, ticks the LED engine and kicks the
  * watchdog.
+ *
+ * A firmware that runs but never reaches "USB configured" would be out
+ * of reach for the update tool. So the first configuration must come
+ * within USB_START_TIMEOUT_MS: otherwise the firmware resets, which
+ * counts as a failed start for the guard (three of them hand the bar to
+ * the bootloader). After the first configuration there is no limit: a
+ * panel reboot leaves the bar powered without a host for a while.
  */
 #include "tsx.h"
+
+#define USB_START_TIMEOUT_MS	60000
 
 int main(void)
 {
@@ -31,11 +40,19 @@ int main(void)
 	cresnet_init();
 	usb_init();
 
+	bool was_configured = false;
+
 	for (;;) {
 		usb_poll();
 		console_poll();
 		cresnet_poll();
 		leds_tick();
 		guard_kick();
+		if (!was_configured) {
+			if (usb_configured())
+				was_configured = true;
+			else if (millis() > USB_START_TIMEOUT_MS)
+				system_reset();
+		}
 	}
 }
