@@ -14,10 +14,16 @@
  * sends its three levels: 02 0D 14 00 03 00 rr 00 04 00 gg 00 05 00 bb.
  * After it starts it sends the update request 02 02 03 00, and the host
  * driver answers with the full state.
+ *
+ * Firmware update: the host sends 02 02 04 04 ("prepare for download").
+ * The application hands the bar to the bootloader (mailbox "UPG") and
+ * resets. See docs/update-protocol.md.
  */
 #include "tsx.h"
 
 #define TYPE_DIGITAL	0x00
+#define TYPE_DOWNLOAD	0x04
+#define SUB_PREPARE	0x04
 #define TYPE_ANALOG	0x14
 #define JOIN_BLINK0	0
 #define JOIN_LEVEL0	3
@@ -60,6 +66,12 @@ void cresnet_rx(const uint8_t *data, size_t n)
 				leds_set_blink_time((int)(join - JOIN_BLINK0), value);
 		}
 		send_state = true;
+		break;
+	case TYPE_DOWNLOAD:
+		if (len >= 2 && data[3] == SUB_PREPARE) {
+			delay_ms(50);	/* let the transfer finish on the bus */
+			guard_request_bootloader();
+		}
 		break;
 	case TYPE_DIGITAL:
 		if (len >= 3) {

@@ -2,28 +2,29 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """tsx-ledbar-flash: load an application image into the xx60 USB LED bar.
 
-The bar (USB 14be:001b) has a text console on interface 0. Its IMGUPD
-command restarts the STM32 into the bootloader, which enumerates again
-(14be:0009) with the MONITOR prompt on the same endpoints. The MONITOR
-command SYSTEM takes the image as XMODEM-CRC (the .upg text itself).
-After the transfer the bootloader checks the image CRC and starts it.
+The bar (USB 14be:001b) takes a new application through its bootloader.
+The host sends a "prepare" packet on the Cresnet interface, the bar
+restarts into the bootloader (14be:001a, one interface), and the host
+sends the S-records of the .upg file as Cresnet packets, block by block
+with an acknowledgement after each block. See docs/update-protocol.md.
 
-Runs on the panel as root. It uses usbdevfs, no libusb and no kernel
-driver for interface 0. The tsx-ledbar service is stopped while the
-flash runs and started again at the end.
+Runs on the panel as root. It uses usbdevfs and the raw attribute of the
+kernel driver leds-crestron-stm32, no libusb. The tsx-ledbar service is
+stopped while the flash runs and started again at the end.
 
   tsx-ledbar-flash info                show the bar, its mode and version
   tsx-ledbar-flash flash FILE.upg      check the file, then load it
   tsx-ledbar-flash console CMD...      one application console command
-  tsx-ledbar-flash monitor CMD...      one bootloader (MONITOR) command
-  tsx-ledbar-flash enter-bootloader    IMGUPD only
-  tsx-ledbar-flash reboot              MONITOR REBOOT (back to the app)
+  tsx-ledbar-flash enter-bootloader    send the prepare packet only
+  tsx-ledbar-flash btl-read [MS]       read bootloader packets for MS ms
   tsx-ledbar-flash power-cycle         cut the USB port power for 3 s
 
 power-cycle: the panel switches VBUS of the bar's port (a regulator on
 the USB host port), so the bar restarts from its bootloader as after a
 power-up. This is the recovery when the bar sits in a mode that does not
-answer on USB.
+answer on USB. The bootloader keeps an image only when its CRC is good,
+so a bar with an interrupted load starts in bootloader mode again and
+takes a new load.
 """
 import ctypes
 import errno
@@ -38,11 +39,20 @@ import time
 
 VID = '14be'
 PID_APP = '001b'
-EP_OUT, EP_IN = 0x01, 0x81
 SERVICE = '/etc/init.d/tsx-ledbar'
+LED_RAW = '/sys/class/leds/tsx:rgb:bar/raw'
 
-SOH, STX, EOT, ACK, NAK, CAN = 0x01, 0x02, 0x04, 0x06, 0x15, 0x18
-BLOCK = 1024
+DEST = 0x02
+TYPE_DOWNLOAD = 0x04
+TYPE_SREC = 0x0D
+SUB_READY = 0x01
+SUB_END_UPDATE = 0x02
+SUB_PREPARE = 0x04
+SUB_END_BLOCK = 0x05
+SUB_ABORT = 0x06
+PKT_PREPARE = bytes([DEST, 0x02, TYPE_DOWNLOAD, SUB_PREPARE])
+PKT_END_BLOCK = bytes([DEST, 0x02, TYPE_DOWNLOAD, SUB_END_BLOCK])
+PKT_END_UPDATE = bytes([DEST, 0x02, TYPE_DOWNLOAD, SUB_END_UPDATE])
 
 
 def log(msg):
@@ -79,6 +89,7 @@ IOC_CLAIM = _IOC(2, 'U', 15, 4)
 IOC_RELEASE = _IOC(2, 'U', 16, 4)
 IOC_BULK = _IOC(3, 'U', 2, 16 if PTR == 4 else 24)
 IOC_CONTROL = _IOC(3, 'U', 0, 16 if PTR == 4 else 24)
+GONE_ERRNOS = (errno.ENODEV, errno.ESHUTDOWN, errno.ECONNRESET, errno.ENOENT, errno.EPIPE)
 
 
 class Bulk(ctypes.Structure):
@@ -94,12 +105,16 @@ class Ctrl(ctypes.Structure):
 
 
 class Bar:
-    """One USB device of the bar, in application or bootloader mode."""
+    """One USB device of the bar, in application or bootloader mode.
+    open() claims one interface: 0 (console, or the bootloader) with the
+    endpoints 0x01/0x81, or 1 (Cresnet io) with 0x02/0x82."""
 
     def __init__(self, sysname, devnode, pid):
         self.sysname, self.devnode, self.pid = sysname, devnode, pid
         self.fd = None
         self.gone = False
+        self.iface = 0
+        self.ep_out, self.ep_in = 0x01, 0x81
 
     @staticmethod
     def find():
@@ -123,15 +138,17 @@ class Bar:
     def is_app(self):
         return self.pid == PID_APP
 
-    def open(self):
+    def open(self, iface=0):
+        self.iface = iface
+        self.ep_out, self.ep_in = (0x01, 0x81) if iface == 0 else (0x02, 0x82)
         self.fd = os.open(self.devnode, os.O_RDWR)
-        fcntl.ioctl(self.fd, IOC_CLAIM, struct.pack('I', 0))
+        fcntl.ioctl(self.fd, IOC_CLAIM, struct.pack('I', iface))
         return self
 
     def close(self):
         if self.fd is not None:
             try:
-                fcntl.ioctl(self.fd, IOC_RELEASE, struct.pack('I', 0))
+                fcntl.ioctl(self.fd, IOC_RELEASE, struct.pack('I', self.iface))
             except OSError:
                 pass
             os.close(self.fd)
@@ -151,19 +168,25 @@ class Bar:
 
     def write(self, data):
         buf = ctypes.create_string_buffer(bytes(data), len(data))
-        b = Bulk(EP_OUT, len(data), 2000, ctypes.cast(buf, ctypes.c_void_p))
-        return fcntl.ioctl(self.fd, IOC_BULK, b)
+        b = Bulk(self.ep_out, len(data), 2000, ctypes.cast(buf, ctypes.c_void_p))
+        try:
+            return fcntl.ioctl(self.fd, IOC_BULK, b)
+        except OSError as e:
+            if e.errno in GONE_ERRNOS:
+                self.gone = True
+                return 0
+            raise
 
     def read(self, timeout_ms=200, n=512):
         buf = ctypes.create_string_buffer(n)
-        b = Bulk(EP_IN, n, timeout_ms, ctypes.cast(buf, ctypes.c_void_p))
+        b = Bulk(self.ep_in, n, timeout_ms, ctypes.cast(buf, ctypes.c_void_p))
         try:
             r = fcntl.ioctl(self.fd, IOC_BULK, b)
         except OSError as e:
             if e.errno == errno.ETIMEDOUT:
                 return b''
-            if e.errno in (errno.ENODEV, errno.ESHUTDOWN, errno.ECONNRESET, errno.ENOENT, errno.EPIPE):
-                self.gone = True	# the bar restarted or left the bus
+            if e.errno in GONE_ERRNOS:
+                self.gone = True
                 return b''
             raise
         return buf.raw[:r]
@@ -176,20 +199,25 @@ class Bar:
         return out
 
     def command(self, line, ms=1500):
-        """Send one text line and return the answer of the next ms."""
+        """Send one console text line and return the answer of the next ms."""
         self.drain(200)
         self.write((line + '\r\n').encode())
         return self.drain(ms).decode('latin-1')
 
-    def read_until(self, token, timeout_s):
-        """Read until token appears or the time is over. Returns the text."""
-        out = b''
-        end = time.monotonic() + timeout_s
-        while time.monotonic() < end and not self.gone:
-            out += self.read(200)
-            if token in out:
-                break
-        return out
+
+def wait_for(pred, timeout_s, what):
+    """Wait for a bar that matches pred. Prints one line per 5 s."""
+    end = time.monotonic() + timeout_s
+    shown = time.monotonic()
+    while time.monotonic() < end:
+        bar = Bar.find()
+        if bar and pred(bar):
+            return bar
+        if time.monotonic() - shown > 5:
+            log('waiting for %s ...' % what)
+            shown = time.monotonic()
+        time.sleep(0.25)
+    return None
 
 
 def port_disable_path(bar=None):
@@ -200,7 +228,6 @@ def port_disable_path(bar=None):
             p = '/sys/bus/usb/devices/usb%s/%s-0:1.0/usb%s-port%s/disable' % (bus, bus, bus, port)
             if os.path.exists(p):
                 return p
-    # no bar on the bus: the default port of the panel (root hub 1, port 1)
     for p in sorted(glob.glob('/sys/bus/usb/devices/usb*/*-0:1.0/usb*-port1/disable')):
         return p
     return None
@@ -218,21 +245,6 @@ def power_cycle(bar=None, off_s=3.0):
     with open(p, 'w') as f:
         f.write('0')
     return wait_for(lambda b: True, 20, 'the bar after the power cycle')
-
-
-def wait_for(pred, timeout_s, what):
-    """Wait for a bar that matches pred. Prints one line per 5 s."""
-    end = time.monotonic() + timeout_s
-    shown = 0
-    while time.monotonic() < end:
-        bar = Bar.find()
-        if bar and pred(bar):
-            return bar
-        if time.monotonic() - shown > 5:
-            log('waiting for %s ...' % what)
-            shown = time.monotonic()
-        time.sleep(0.25)
-    return None
 
 
 # ---- service ----------------------------------------------------------------
@@ -259,41 +271,132 @@ class Service:
             self.stopped = False
 
 
-# ---- XMODEM -----------------------------------------------------------------
+# ---- application mode: the prepare packet ------------------------------------
 
-def xmodem_send(bar, payload, upg):
-    """Send payload (bytes) as XMODEM-CRC with 1 KB blocks. The last block
-    is padded with CR LF pairs: the bootloader splits the text at line
-    ends, and an empty line carries no record."""
-    if len(payload) % 2:
-        payload += b'\n'
-    nblocks = (len(payload) + BLOCK - 1) // BLOCK
-    log('XMODEM: %d bytes in %d blocks of %d' % (len(payload), nblocks, BLOCK))
+def send_io_packet(bar, pkt):
+    """Send one Cresnet packet on interface 1: through the kernel driver's
+    raw attribute when it is bound, otherwise with usbdevfs."""
+    if os.path.exists(LED_RAW):
+        with open(LED_RAW, 'wb') as f:
+            f.write(pkt)
+        return 'driver raw attribute'
+    bar.open(1)
+    try:
+        bar.write(pkt)
+    finally:
+        bar.close()
+    return 'usbdevfs interface 1'
+
+
+def enter_bootloader(bar, service):
+    service.stop()
+    bar.open(0)
+    try:
+        log('bar %s in application mode, firmware "%s"' % (bar.sysname, bar.string(4)))
+    finally:
+        bar.close()
+    how = send_io_packet(bar, PKT_PREPARE)
+    log('sent the prepare packet %s (%s)' % (PKT_PREPARE.hex(' '), how))
+    gone = wait_for(lambda b: b.sysname != bar.sysname or b.devnode != bar.devnode or not b.is_app,
+                    15, 'the bar to restart')
+    if gone is None:
+        die('the bar did not restart after the prepare packet')
+    return wait_for(lambda b: not b.is_app, 20, 'the bootloader')
+
+
+# ---- bootloader mode: the upload ---------------------------------------------
+
+def pkt_text(p):
+    return p.hex(' ') if p else '(nothing)'
+
+
+def wait_ready(bar, timeout_s=10):
+    """Read until the ready packet (type 04, sub-type 01, block size).
+    Returns the block size. Reads on until the bar goes quiet."""
+    time.sleep(0.1)
+    end = time.monotonic() + timeout_s
+    size = None
+    while time.monotonic() < end:
+        p = bar.read(1000)
+        if not p:
+            if size is not None:
+                return size
+            continue
+        log('bootloader: %s' % pkt_text(p))
+        if len(p) >= 4 and p[2] == TYPE_DOWNLOAD and p[3] == SUB_ABORT:
+            die('the bootloader aborted')
+        if len(p) == 5 and p[2] == TYPE_DOWNLOAD and p[3] == SUB_READY:
+            size = 1 << p[4]
+            log('bootloader ready, block size %d' % size)
+            end = time.monotonic() + 3
+    if size is None:
+        die('no ready packet from the bootloader')
+    return size
+
+
+def end_block(bar, tries=60):
+    bar.write(PKT_END_BLOCK)
+    for _ in range(tries):
+        p = bar.read(1000)
+        if not p:
+            continue
+        if len(p) >= 4 and p[2] == TYPE_DOWNLOAD:
+            if p[3] == SUB_READY:
+                return
+            if p[3] == SUB_ABORT:
+                die('the bootloader aborted the update (%s)' % pkt_text(p))
+        log('bootloader: %s (not the block acknowledgement)' % pkt_text(p))
+    die('no acknowledgement after the end-of-block packet')
+
+
+def srec_packet(body):
+    """body = the record bytes after the count: address, data, checksum."""
+    return bytes([DEST, len(body) + 1, TYPE_SREC]) + body
+
+
+def upload(bar, records):
+    """records: [(addr, body)] with the tag record first."""
+    size = wait_ready(bar)
     t0 = time.monotonic()
-    for i in range(nblocks):
-        chunk = payload[i * BLOCK:(i + 1) * BLOCK]
-        chunk += b'\r\n' * ((BLOCK - len(chunk)) // 2)
-        num = (i + 1) & 0xFF
-        crc = upg.crc16_xmodem(chunk)
-        frame = bytes([STX, num, 255 - num]) + chunk + bytes([crc >> 8, crc & 0xFF])
-        for attempt in range(10):
-            bar.write(frame)
-            reply = bar.read_until(bytes([ACK]), 12)
-            if ACK in reply:
-                break
-            if CAN in reply:
-                die('bootloader cancelled the transfer at block %d: %r' % (i + 1, reply))
-            log('block %d: no ACK (%r), sending it again' % (i + 1, reply[-8:]))
-        else:
-            die('block %d not accepted after 10 tries' % (i + 1))
-        if (i + 1) % 16 == 0 or i + 1 == nblocks:
-            log('block %d/%d (%d%%)' % (i + 1, nblocks, 100 * (i + 1) // nblocks))
-    bar.write(bytes([EOT]))
-    reply = bar.read_until(bytes([ACK]), 10)
-    if ACK not in reply:
-        die('no ACK after EOT: %r' % reply)
-    log('transfer done in %.1f s' % (time.monotonic() - t0))
-    return bar.drain(1500).decode('latin-1')
+    tag_addr, tag_body = records[0]
+    bar.write(srec_packet(tag_body))
+    end_block(bar)
+    log('tag record accepted (%d data records follow)' % (len(records) - 1))
+    blocks = 1
+    block_start = None
+    n = len(records) - 1
+    for i, (addr, body) in enumerate(records[1:], 1):
+        if block_start is None:
+            block_start = addr
+        elif addr > block_start + size:
+            end_block(bar)
+            blocks += 1
+            block_start = addr
+            if blocks % 16 == 0:
+                log('record %d/%d (%d%%), %d blocks' % (i, n, 100 * i // n, blocks))
+        bar.write(srec_packet(body))
+        if bar.gone:
+            die('the bar left the bus during the upload (record %d)' % i)
+    bar.write(PKT_END_UPDATE)
+    log('all %d records sent in %d blocks, %.1f s, end of update sent' % (n, blocks, time.monotonic() - t0))
+    tail = bar.drain(1000)
+    if tail:
+        log('bootloader: %s' % pkt_text(tail))
+
+
+def read_records(path, upg):
+    """The records of the .upg as (addr, body bytes). The body is the
+    record after its count byte: address, data and checksum."""
+    with open(path, 'rb') as f:
+        text = f.read().decode('ascii')
+    out = []
+    for line in text.replace('\r', '\n').split('\n'):
+        if not line:
+            continue
+        t, addr, data = upg.parse_record(line)
+        raw = bytes.fromhex(line[2:])
+        out.append((addr, raw[1:]))
+    return out
 
 
 # ---- commands ---------------------------------------------------------------
@@ -304,36 +407,11 @@ def show_text(text, prefix='  '):
             print(prefix + l, flush=True)
 
 
-def enter_bootloader(bar, service):
-    service.stop()
-    bar.open()
-    try:
-        log('bar %s in application mode, firmware "%s"' % (bar.sysname, bar.string(4)))
-        log('sending IMGUPD')
-        bar.command('IMGUPD', 500)
-    finally:
-        bar.close()
-    gone = wait_for(lambda b: b.sysname != bar.sysname or not b.is_app, 15, 'the bar to restart')
-    if gone is None:
-        die('the bar did not restart after IMGUPD')
-    return wait_for(lambda b: not b.is_app, 20, 'the bootloader')
-
-
-def monitor_prompt(bar):
-    """Get the MONITOR prompt of the bar (open, in bootloader mode)."""
-    text = bar.command('', 1000)
-    if 'MONITOR' not in text:
-        text += bar.command('VERSION', 1500)
-    if 'MONITOR' not in text:
-        die('no MONITOR prompt from 14be:%s, got %r' % (bar.pid, text[-120:]))
-    return text
-
-
 def cmd_info(args):
     bar = Bar.find()
     if bar is None:
         die('no LED bar on USB (14be:*)')
-    bar.open()
+    bar.open(0)
     try:
         print('device    %s (%s) 14be:%s' % (bar.sysname, bar.devnode, bar.pid))
         for i in range(1, 5):
@@ -345,21 +423,37 @@ def cmd_info(args):
             if 'TSX-LEDBAR' in text:
                 show_text(bar.command('CAPS', 1000), 'caps      ')
         else:
-            print('mode      bootloader (MONITOR)')
-            show_text(bar.command('VERSION', 1500), 'version   ')
+            print('mode      bootloader')
     finally:
         bar.close()
 
 
-def cmd_console(args, monitor=False):
+def cmd_console(args):
     bar = Bar.find()
     if bar is None:
         die('no LED bar on USB')
-    if monitor == bar.is_app:
-        die('the bar is in %s mode' % ('application' if bar.is_app else 'bootloader'))
-    bar.open()
+    if not bar.is_app:
+        die('the bar is in bootloader mode')
+    bar.open(0)
     try:
         show_text(bar.command(' '.join(args.cmd), args.ms), '')
+    finally:
+        bar.close()
+
+
+def cmd_btl_read(args):
+    bar = Bar.find()
+    if bar is None:
+        die('no LED bar on USB')
+    if bar.is_app:
+        die('the bar is in application mode')
+    bar.open(0)
+    try:
+        end = time.monotonic() + args.ms / 1000.0
+        while time.monotonic() < end:
+            p = bar.read(500)
+            if p:
+                log('bootloader: %s' % pkt_text(p))
     finally:
         bar.close()
 
@@ -378,27 +472,13 @@ def cmd_enter(args):
     log('bootloader on %s as 14be:%s' % (bar.sysname, bar.pid))
 
 
-def cmd_reboot(args):
-    bar = Bar.find()
+def cmd_power_cycle(args):
+    bar = power_cycle(Bar.find())
     if bar is None:
-        die('no LED bar on USB')
-    bar.open()
+        die('the bar did not come back after the power cycle')
+    bar.open(0)
     try:
-        if bar.is_app:
-            log('application REBOOT')
-            bar.command('REBOOT', 300)
-        else:
-            monitor_prompt(bar)
-            log('MONITOR REBOOT')
-            bar.command('REBOOT', 300)
-    finally:
-        bar.close()
-    bar = wait_for(lambda b: b.is_app, 30, 'the application')
-    if bar is None:
-        die('the application did not come back')
-    bar.open()
-    try:
-        log('application up: %s' % bar.string(4))
+        log('bar %s up as 14be:%s, string 4 "%s"' % (bar.sysname, bar.pid, bar.string(4)))
     finally:
         bar.close()
 
@@ -414,10 +494,9 @@ def cmd_flash(args):
             print('  %-14s BAD  %s' % (name, text))
         die('%s failed its checks, nothing sent' % args.upg)
     hdr = upg.header_fields(img, base)
-    with open(args.upg, 'rb') as f:
-        payload = f.read()
-    log('image %s: version %d.%d.%d, %d bytes at 0x%08X, checks ok' % (
-        args.upg, hdr['major'], hdr['minor'], hdr['build'], len(img), base))
+    records = read_records(args.upg, upg)
+    log('image %s: version %d.%d.%d, %d bytes at 0x%08X, %d records, checks ok' % (
+        args.upg, hdr['major'], hdr['minor'], hdr['build'], len(img), base, len(records)))
 
     bar = Bar.find()
     if bar is None:
@@ -431,35 +510,24 @@ def cmd_flash(args):
         else:
             service.stop()
             log('bar %s is already in bootloader mode (14be:%s)' % (bar.sysname, bar.pid))
-        bar.open()
+        bar.open(0)
         try:
             log('bootloader on %s as 14be:%s, string 4 "%s"' % (bar.sysname, bar.pid, bar.string(4)))
-            show_text(monitor_prompt(bar))
-            log('sending SYSTEM, waiting for the XMODEM start')
-            bar.drain(200)
-            bar.write(b'SYSTEM\r\n')
-            text = bar.read_until(b'C', 70)
-            show_text(text.decode('latin-1'))
-            if b'C' not in text:
-                die('the bootloader did not start XMODEM')
-            tail = xmodem_send(bar, payload, upg)
-            show_text(tail)
+            upload(bar, records)
         finally:
             bar.close()
         log('waiting for the new application')
-        app = wait_for(lambda b: b.is_app and b.sysname != bar.sysname or b.is_app and b.devnode != bar.devnode, 40,
-                       'the application')
+        app = wait_for(lambda b: b.is_app and b.devnode != bar.devnode, 40, 'the application')
         if app is None:
-            bar = Bar.find()
-            die('the application did not start (bar: %s)' % (
-                '14be:%s on %s, still in bootloader mode' % (bar.pid, bar.sysname) if bar else 'not on USB'))
-        app.open()
+            now = Bar.find()
+            die('the application did not start (bar: %s). Run the flash again.' % (
+                '14be:%s on %s, bootloader mode' % (now.pid, now.sysname) if now else 'not on USB'))
+        app.open(0)
         try:
             fw = app.string(4)
             log('application up: "%s"' % fw)
             time.sleep(0.5)
-            ver = app.command('VER', 1000)
-            show_text(ver, '  ver: ')
+            show_text(app.command('VER', 1000), '  ver: ')
             want = ['%d' % hdr['major'], '%d' % hdr['minor'], '%d' % hdr['build']]
             got = [str(int(x)) for x in ''.join(c if c.isdigit() else ' ' for c in fw).split()]
             if not all(w in got for w in want):
@@ -471,17 +539,6 @@ def cmd_flash(args):
         service.start()
 
 
-def cmd_power_cycle(args):
-    bar = power_cycle(Bar.find())
-    if bar is None:
-        die('the bar did not come back after the power cycle')
-    bar.open()
-    try:
-        log('bar %s up as 14be:%s, string 4 "%s"' % (bar.sysname, bar.pid, bar.string(4)))
-    finally:
-        bar.close()
-
-
 def main():
     import argparse
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
@@ -490,9 +547,8 @@ def main():
     sub.add_parser('info')
     a = sub.add_parser('flash'); a.add_argument('upg')
     a = sub.add_parser('console'); a.add_argument('cmd', nargs='+'); a.add_argument('--ms', type=int, default=1500)
-    a = sub.add_parser('monitor'); a.add_argument('cmd', nargs='+'); a.add_argument('--ms', type=int, default=1500)
+    a = sub.add_parser('btl-read'); a.add_argument('ms', type=int, nargs='?', default=3000)
     sub.add_parser('enter-bootloader')
-    sub.add_parser('reboot')
     sub.add_parser('power-cycle')
     args = p.parse_args()
     if os.geteuid() != 0:
@@ -503,12 +559,10 @@ def main():
         cmd_flash(args)
     elif args.cmd == 'console':
         cmd_console(args)
-    elif args.cmd == 'monitor':
-        cmd_console(args, monitor=True)
+    elif args.cmd == 'btl-read':
+        cmd_btl_read(args)
     elif args.cmd == 'enter-bootloader':
         cmd_enter(args)
-    elif args.cmd == 'reboot':
-        cmd_reboot(args)
     elif args.cmd == 'power-cycle':
         cmd_power_cycle(args)
 

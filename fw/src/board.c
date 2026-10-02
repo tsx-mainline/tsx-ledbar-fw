@@ -21,6 +21,7 @@
 #define SYSCLK_HZ 120000000U
 #endif
 
+#ifndef TSX_QEMU
 static const struct rcc_clock_scale clock_120mhz_hse25 = {
 	.pllm = 25,
 	.plln = 240,
@@ -33,6 +34,7 @@ static const struct rcc_clock_scale clock_120mhz_hse25 = {
 	.apb1_frequency = 30000000,
 	.apb2_frequency = 60000000,
 };
+#endif
 
 static volatile uint32_t ms_ticks;
 

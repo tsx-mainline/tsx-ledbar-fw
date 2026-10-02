@@ -96,7 +96,7 @@ static void cmd_help(void)
 		"STATUS                    joins, duties, effect, uptime\r\n"
 		"ERRLOG | CLEARERR         error log\r\n"
 		"REBOOT                    restart the application\r\n"
-		"IMGUPD                    restart into the bootloader (XMODEM update)\r\n"
+		"IMGUPD                    restart into the bootloader (USB update mode)\r\n"
 		"TLCOUTMODE COLOR NUM MODE output mode of a TLC59116 output (NUM 0-15 or ALL)\r\n"
 		"TLCGROUPMODE COLOR MODE   0 = group dimming, 1 = group blinking\r\n"
 		"TLCBRIGHTNESS COLOR NUM|GROUP PERCENT\r\n"
