@@ -269,11 +269,16 @@ void leds_tick(void)
 	apply();
 }
 
-/* a host join ends an effect: the host is the master of the color */
+/*
+ * A host join ends an effect: the host is the master of the color. The
+ * ramp goes back to the host color also when the join did not change that
+ * color, because the effect left another color on the bar. Without an
+ * effect, leds_tick starts a ramp when the host color changes.
+ */
 static void host_update(void)
 {
 	if (fx != FX_NONE && fx != FX_DIRECT)
-		fx = FX_NONE;
+		leds_fx_off();
 }
 
 void leds_set_level(int color, unsigned level)

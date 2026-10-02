@@ -133,6 +133,23 @@ def main():
         leds = leds_in(out)
         check(leds and leds[-1][1:] == (24029, 24029, 24029), 'FX OFF restores the host color: %s' % (leds[-1:],))
 
+        # a host join that keeps the host color also ends a fade, and the bar
+        # goes back to the host color (0.1.1 kept the fade color)
+        m.cmd('FX FADE 0 0 0 300', 1.0)
+        out = m.cmd('LED RED LEVEL 100', 0.8)
+        leds = leds_in(out)
+        check(leds and leds[-1][1:] == (24029, 24029, 24029),
+              'a join with the same host color ends FX FADE and restores the host color: %s' % (leds[-1:],))
+        check('fx off' in m.cmd('FX'), 'the join ends the fade effect')
+        m.cmd('FX SMOOTH 300')
+        m.cmd('FX FADE 0 0 0 0', 0.5)
+        out = m.cmd('LED RED CONTROL 1', 1.0)
+        leds = leds_in(out)
+        reds = [l[1] for l in leds]
+        check(len(set(reds)) >= 10 and reds == sorted(reds) and leds[-1][1:] == (24029, 24029, 24029),
+              'with FX SMOOTH the same join ramps back to the host color: %d steps, end %s' % (len(set(reds)), leds[-1:]))
+        m.cmd('FX SMOOTH 0')
+
         out = m.cmd('FX RAINBOW 1000 50', 1.2)
         leds = leds_in(out)
         check(len(leds) >= 20 and len(set(l[1:] for l in leds)) >= 20, 'rainbow changes the color: %d steps' % len(leds))
@@ -140,7 +157,7 @@ def main():
         leds = leds_in(out)
         check((65535, 0, 0) in [l[1:] for l in leds] and (0, 0, 0) in [l[1:] for l in leds], 'blink toggles red')
         out = m.cmd('LED RED LEVEL 10', 0.8)
-        check('fx off' in m.cmd('FX') or True, 'a host join ends the effect')
+        check('fx off' in m.cmd('FX'), 'a host join ends the effect')
         check(leds_in(out) and leds_in(out)[-1][1:] == (403, 35842, 35842), 'host color after the join, capped: %s' % (leds_in(out)[-1:],))
 
         # breathe: no jump and no long dwell at the bottom of the wave
@@ -152,8 +169,14 @@ def main():
         steps = [abs(b - a) for a, b in zip(reds, reds[1:]) if min(a, b) < 1000]
         check(first is not None and first < 50, 'breathe: first step above off is tiny (%s of 65535)' % first)
         check(steps and max(steps) < 300, 'breathe: steps near the bottom stay small (max %s)' % (max(steps) if steps else None))
+        # The QEMU clock runs faster than the wall clock, so the trace holds
+        # more than two periods. When a tick falls on the period start, each
+        # period has one tick at zero. A dwell gives more.
+        trace = leds_in(out)
+        periods = (trace[-1][0] - trace[0][0]) // 2000 if trace else 0
         zeros = sum(1 for r in reds if r == 0)
-        check(zeros <= 6, 'breathe: at most 6 ticks at zero in two periods (%d)' % zeros)
+        check(trace and zeros <= periods + 1,
+              'breathe: at most one tick at zero per period (%d in %d periods)' % (zeros, periods))
         check(len(low) >= 4, 'breathe: several distinct ticks below 1000 (%d)' % len(low))
         out = m.cmd('STATUS')
         check(re.search(r'pwm:grp \d+:\d+', out) is not None, 'STATUS shows the PWM and group values')
