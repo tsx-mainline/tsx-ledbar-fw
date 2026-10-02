@@ -145,7 +145,7 @@ def main():
         m.cmd('TRACE OFF')
 
         # the guard: three starts without "USB configured" (never in QEMU),
-        # then the fourth start asks for the bootloader (mailbox "UPE")
+        # then the fourth start asks for the bootloader (mailbox "UPG")
         for n in (2, 3):
             m.send('REBOOT')
             text, hit = m.wait_for(r'qemu start (\d+) mailbox 0x([0-9A-F]+)', 10)
