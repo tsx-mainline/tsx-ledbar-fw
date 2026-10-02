@@ -177,7 +177,11 @@ class Bar:
                 return 0
             raise
 
-    def read(self, timeout_ms=200, n=512):
+    def read(self, timeout_ms=200, n=64):
+        """One bulk IN transfer of one packet. A transfer of one packet
+        completes as soon as the packet arrives: a larger transfer would
+        wait for a short packet, and usbfs drops the data of a transfer
+        that times out."""
         buf = ctypes.create_string_buffer(n)
         b = Bulk(self.ep_in, n, timeout_ms, ctypes.cast(buf, ctypes.c_void_p))
         try:
