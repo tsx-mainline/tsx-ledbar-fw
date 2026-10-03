@@ -33,12 +33,20 @@
  * with 8 fraction bits, and the duty is interpolated between the table
  * entries.
  *
- * Power cap: the sum of the 48 duties stays at or below "cap" percent of
- * one full channel on all 16 LEDs (16 x 65535). The default 110 is the
- * total the stock firmware allows. When the sum is above the cap, all
- * duties scale by the same factor. With one color on the whole bar, this
- * gives the same duties as the cap of 0.1.2 (sum of the three duties at
- * or below 110 % of 65535).
+ * Power limits: one value "cap" (FX CAP, default 110) sets two limits.
+ * 1. The per-LED limit: the sum of the red, green and blue duty of one LED
+ *    stays at or below cap percent of one full channel (65535). When the
+ *    sum is above the limit, the three duties of that LED scale by the
+ *    same factor, so the LED keeps its hue. The stock firmware never
+ *    gives one LED more than 110 %. This is the cap of 0.1.2.
+ * 2. The bar cap: the sum of the 48 duties stays at or below cap percent
+ *    of one full channel on all 16 LEDs (16 x 65535). When the sum is
+ *    above the cap, all duties scale by the same factor.
+ * The engine applies the per-LED limit first. Then the sum of the 48
+ * duties is never above the bar cap, so the bar cap is a second guard.
+ * With one color on the whole bar, both limits give the duties of 0.1.2.
+ * CHASE and FILL apply the per-LED limit to their color before they share
+ * it between rows, so a dot or a part of a row keeps its part of the light.
  *
  * Dimming: brightness on the chip is PWMx x GRPPWM (see i2c_tlc.c), with
  * one PWMx per output and one GRPPWM per chip. GRPPWM is the smallest
@@ -63,6 +71,15 @@ static const uint8_t led_out[NLEDS] = {
 	14, 13, 12, 11, 10, 9, 8, 7,	/* L1..L8 */
 };
 
+/*
+ * The ring: the LED index in ring order, clockwise seen from the front.
+ * Down the right side (R1..R8), then up the left side (L8..L1).
+ */
+static const uint8_t ring_led[NLEDS] = {
+	0, 1, 2, 3, 4, 5, 6, 7,		/* R1..R8 */
+	15, 14, 13, 12, 11, 10, 9, 8,	/* L8..L1 */
+};
+
 enum fx {
 	FX_NONE, FX_FADE, FX_BLINK, FX_BREATHE, FX_RAINBOW, FX_DIRECT,
 	FX_CHASE, FX_FILL, FX_SPECTRUM, FX_SPLIT,
@@ -81,8 +98,10 @@ static enum fx fx;
 static uint8_t fx_rgb[NCOLORS];
 static uint32_t fx_t0, fx_a, fx_b;
 static uint8_t fx_level;
+static bool fx_ring;		/* SPECTRUM: the ring, not the rows */
 static uint16_t direct_duty[NCOLORS];
 static uint32_t last_tick;
+static bool fx_limited;	/* CHASE, FILL: the per-LED limit scaled the effect color */
 
 /* the registers PWM0..15 and GRPPWM as the engine last wrote them */
 static uint8_t sent[NCOLORS][TLC_DIM_REGS];
@@ -240,6 +259,35 @@ static void base_color(int32_t out[NLEDS][NCOLORS])
 	fill_all(out, host);
 }
 
+/* the per-LED limit: the highest red + green + blue duty of one LED */
+static uint32_t led_limit(void)
+{
+	return cap_percent * 65535U / 100U;
+}
+
+/*
+ * Scale the three duties of one LED to the per-LED limit with one factor,
+ * so the LED keeps its hue. Return true when the duties change.
+ */
+static bool limit_led(uint32_t d[NCOLORS])
+{
+	uint32_t lim = led_limit(), sum = d[RED] + d[GREEN] + d[BLUE];
+
+	if (sum <= lim)
+		return false;
+	for (int c = 0; c < NCOLORS; c++)
+		d[c] = (uint32_t)((uint64_t)d[c] * lim / sum);
+	return true;
+}
+
+/* the duties of an effect color 0..100 after the per-LED limit */
+static bool limited_color(const uint8_t rgb[NCOLORS], uint32_t d[NCOLORS])
+{
+	for (int c = 0; c < NCOLORS; c++)
+		d[c] = level_to_duty((rgb[c] > 100 ? 100 : rgb[c]) * FP);
+	return limit_led(d);
+}
+
 static void start_ramp(int32_t to[NLEDS][NCOLORS], uint32_t ms)
 {
 	memcpy(ramp_from, cur, sizeof(cur));
@@ -324,15 +372,20 @@ static bool chip_write(int c, const uint8_t v[TLC_DIM_REGS])
 static void apply(void)
 {
 	uint32_t duty[NLEDS][NCOLORS];
-	uint64_t sum = 0, cap = (uint64_t)NLEDS * (cap_percent * 65535U / 100U);
+	uint64_t sum = 0, cap = (uint64_t)NLEDS * led_limit();
+	uint16_t limited = 0;
 	uint8_t v[TLC_DIM_REGS];
 
 	for (int i = 0; i < NLEDS; i++) {
-		for (int c = 0; c < NCOLORS; c++) {
+		for (int c = 0; c < NCOLORS; c++)
 			duty[i][c] = fx == FX_DIRECT ? direct_duty[c] : level_to_duty(cur[i][c]);
-			sum += duty[i][c];
-		}
+		if (limit_led(duty[i]) ||
+		    (fx_limited && (fx == FX_CHASE || fx == FX_FILL) &&
+		     duty[i][RED] + duty[i][GREEN] + duty[i][BLUE] > 0))
+			limited |= (uint16_t)(1U << i);
+		sum += duty[i][RED] + duty[i][GREEN] + duty[i][BLUE];
 	}
+	st.limited = limited;
 	if (sum > cap) {
 		for (int i = 0; i < NLEDS; i++) {
 			for (int c = 0; c < NCOLORS; c++)
@@ -380,6 +433,9 @@ static void apply(void)
 static void run_chase(uint32_t now)
 {
 	uint32_t pos = (now - fx_t0) % fx_a * (NROWS * 256U) / fx_a;	/* 0..2047 */
+	uint32_t full[NCOLORS];
+
+	fx_limited = limited_color(fx_rgb, full);	/* FX CAP can change while it runs */
 
 	for (int r = 0; r < NROWS; r++) {
 		int32_t d = (int32_t)pos - r * 256;
@@ -392,7 +448,7 @@ static void run_chase(uint32_t now)
 		k = d >= 256 ? 0 : 256U - (uint32_t)d;	/* 0..256 */
 		for (int c = 0; c < NCOLORS; c++) {
 			/* share the light, not the lightness, so the sum stays the same */
-			int32_t l = duty_to_level(level_to_duty(fx_rgb[c] * FP) * k / 256U);
+			int32_t l = duty_to_level(full[c] * k / 256U);
 
 			cur[r][c] = l;
 			cur[NROWS + r][c] = l;
@@ -400,11 +456,24 @@ static void run_chase(uint32_t now)
 	}
 }
 
-/* SPECTRUM: the hue circle over the 8 rows of each side, moving down */
+/*
+ * SPECTRUM: the hue circle over the 16 LEDs in ring order, moving
+ * clockwise, or over the 8 rows of each side, moving down. The hue of
+ * each LED is 1/16 (ring) or 1/8 (rows) of the circle after the hue of
+ * the LED before it.
+ */
 static void run_spectrum(uint32_t now)
 {
 	uint32_t phase = (now - fx_t0) % fx_a * 1536U / fx_a;
 
+	if (fx_ring) {
+		for (int p = 0; p < NLEDS; p++) {
+			uint32_t hue = (p * (1536U / NLEDS) + 1536U - phase) % 1536U;
+
+			hue_to_rgb(hue, fx_level, cur[ring_led[p]]);
+		}
+		return;
+	}
 	for (int r = 0; r < NROWS; r++) {
 		uint32_t hue = (r * (1536U / NROWS) + 1536U - phase) % 1536U;
 
@@ -619,14 +688,19 @@ void leds_fx_chase(const uint8_t rgb[3], uint32_t period_ms)
  */
 void leds_fx_fill(const uint8_t rgb[3], unsigned percent)
 {
-	int32_t to[NLEDS][NCOLORS];
+	int32_t to[NLEDS][NCOLORS], lvl[NCOLORS];
 	int32_t fill = (int32_t)((percent > 100 ? 100 : percent) * NROWS * FP / 100U);
+	uint32_t full[NCOLORS];
 
+	/* the level of a full row, after the per-LED limit */
+	fx_limited = limited_color(rgb, full);
+	for (int c = 0; c < NCOLORS; c++)
+		lvl[c] = fx_limited ? duty_to_level(full[c]) : (rgb[c] > 100 ? 100 : rgb[c]) * FP;
 	for (int r = 0; r < NROWS; r++) {
 		int32_t part = clamp(fill - (NROWS - 1 - r) * FP, 0, FP);	/* 0..FP */
 
 		for (int c = 0; c < NCOLORS; c++) {
-			to[r][c] = (rgb[c] > 100 ? 100 : rgb[c]) * part;
+			to[r][c] = lvl[c] * part / FP;
 			to[NROWS + r][c] = to[r][c];
 		}
 	}
@@ -634,10 +708,11 @@ void leds_fx_fill(const uint8_t rgb[3], unsigned percent)
 	start_ramp(to, smooth_ms);
 }
 
-void leds_fx_spectrum(uint32_t period_ms, uint8_t level)
+void leds_fx_spectrum(uint32_t period_ms, uint8_t level, bool ring)
 {
 	fx_a = period_ms < 100 ? 100 : period_ms;
 	fx_level = level > 100 ? 100 : level;
+	fx_ring = ring;
 	fx_t0 = millis();
 	fx = FX_SPECTRUM;
 }

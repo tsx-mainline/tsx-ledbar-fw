@@ -172,7 +172,8 @@ static void cmd_help(void)
 		"LED CLEAR                 drop the LED pattern, show the host color\r\n"
 		"FX OFF | FADE R G B MS | BLINK R G B ON_MS OFF_MS | BREATHE R G B MS\r\n"
 		"FX RAINBOW MS [LEVEL] | SMOOTH MS | CAP PERCENT\r\n"
-		"FX CHASE R G B MS | FILL R G B PERCENT | SPECTRUM MS [LEVEL]\r\n"
+		"FX CHASE R G B MS | FILL R G B PERCENT\r\n"
+		"FX SPECTRUM MS [LEVEL] [RING|ROWS]   RING (default) turns around the bar\r\n"
 		"FX SPLIT R G B R G B      right side color, left side color\r\n");
 }
 
@@ -193,7 +194,8 @@ static void cmd_status(void)
 		       (unsigned long)leds_get_smooth(), leds_get_cap());
 	console_printf("pwm:grp %u:%u %u:%u %u:%u (duty of 65535)\r\n",
 		       pwm[0], grp[0], pwm[1], grp[1], pwm[2], grp[2]);
-	console_printf("leds %s (LED GET shows each LED)\r\n", s->pattern_on ? "pattern" : "host");
+	console_printf("leds %s%s (LED GET shows each LED)\r\n", s->pattern_on ? "pattern" : "host",
+		       s->limited ? " limit" : "");
 	console_printf("chips %s %s %s uptime %lu ms start %lu reset flags 0x%08lX errors %d\r\n",
 		       tlc_ready(RED) ? "ok" : "BAD", tlc_ready(GREEN) ? "ok" : "BAD",
 		       tlc_ready(BLUE) ? "ok" : "BAD", (unsigned long)millis(),
@@ -292,8 +294,8 @@ static void led_get(int first, int last)
 
 	for (int c = 0; c < NCOLORS; c++)
 		tlc_get_dim(c, &pwm, &grp[c]);
-	console_printf("leds %s fx %s grp %u %u %u\r\n", s->pattern_on ? "pattern" : "host",
-		       leds_fx_name(), grp[0], grp[1], grp[2]);
+	console_printf("leds %s fx %s grp %u %u %u%s\r\n", s->pattern_on ? "pattern" : "host",
+		       leds_fx_name(), grp[0], grp[1], grp[2], s->limited ? " limit" : "");
 	for (int i = first; i <= last; i++) {
 		int o = leds_output(i);
 		uint8_t lvl[NCOLORS];
@@ -301,10 +303,11 @@ static void led_get(int first, int last)
 
 		leds_base_level(i, lvl);
 		led_name(i, name);
-		console_printf("%d %s out %d level %u %u %u duty %u %u %u pwm %u %u %u\r\n",
+		console_printf("%d %s out %d level %u %u %u duty %u %u %u pwm %u %u %u%s\r\n",
 			       i, name, o, lvl[0], lvl[1], lvl[2],
 			       s->led_duty[i][0], s->led_duty[i][1], s->led_duty[i][2],
-			       tlc_get_pwm(RED, o), tlc_get_pwm(GREEN, o), tlc_get_pwm(BLUE, o));
+			       tlc_get_pwm(RED, o), tlc_get_pwm(GREEN, o), tlc_get_pwm(BLUE, o),
+			       s->limited & (1U << i) ? " limit" : "");
 	}
 }
 
@@ -393,12 +396,25 @@ static void cmd_fx(int argc, char **argv)
 		   num_arg(argv[5], 0, 100, &a)) {
 		leds_fx_fill(rgb, (unsigned)a);
 	} else if (eq(argv[1], "SPECTRUM") && argc >= 3 && num_arg(argv[2], 100, 600000, &a)) {
+		bool ring = true;
+		int n = 3;
+
 		b = 100;
-		if (argc > 3 && !num_arg(argv[3], 0, 100, &b)) {
-			console_write("bad level\r\n");
-			return;
+		if (argc > n && !eq(argv[n], "RING") && !eq(argv[n], "ROWS")) {
+			if (!num_arg(argv[n], 0, 100, &b)) {
+				console_write("bad level\r\n");
+				return;
+			}
+			n++;
 		}
-		leds_fx_spectrum((uint32_t)a, (uint8_t)b);
+		if (argc > n) {
+			if (!eq(argv[n], "RING") && !eq(argv[n], "ROWS")) {
+				console_write("usage: see HELP\r\n");
+				return;
+			}
+			ring = eq(argv[n], "RING");
+		}
+		leds_fx_spectrum((uint32_t)a, (uint8_t)b, ring);
 	} else if (eq(argv[1], "SPLIT") && argc >= 8 && rgb_args(argv + 2, rgb) &&
 		   rgb_args(argv + 5, rgb2)) {
 		leds_fx_split(rgb, rgb2);

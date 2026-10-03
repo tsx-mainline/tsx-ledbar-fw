@@ -78,6 +78,7 @@ struct led_state {
 	uint16_t led_duty[NLEDS][NCOLORS];	/* duty sent for each LED */
 	uint8_t pattern[NLEDS][NCOLORS];	/* LED pattern levels 0..100 */
 	bool pattern_on;		/* the pattern, not the host color, is the base */
+	uint16_t limited;		/* bit i: the per-LED limit scales LED i */
 };
 void leds_init(void);
 void leds_tick(void);			/* run every ms from the main loop */
@@ -99,7 +100,7 @@ void leds_fx_breathe(const uint8_t rgb[3], uint32_t period_ms);
 void leds_fx_rainbow(uint32_t period_ms, uint8_t level);
 void leds_fx_chase(const uint8_t rgb[3], uint32_t period_ms);
 void leds_fx_fill(const uint8_t rgb[3], unsigned percent);
-void leds_fx_spectrum(uint32_t period_ms, uint8_t level);
+void leds_fx_spectrum(uint32_t period_ms, uint8_t level, bool ring);	/* ring or rows */
 void leds_fx_split(const uint8_t right[3], const uint8_t left[3]);
 void leds_set_smooth(uint32_t ms);
 uint32_t leds_get_smooth(void);
