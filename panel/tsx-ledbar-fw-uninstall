@@ -33,7 +33,7 @@ restart_bar_users() {
 if [ -n "$1" ]; then
 	IMAGE=$1
 else
-	IMAGE=$(ls "$STOCK_DIR"/statussign_*.upg 2>/dev/null | sort | tail -1)
+	IMAGE=$(ls "$STOCK_DIR"/statussign_*.upg 2>/dev/null | sort -V | tail -1)
 	[ -n "$IMAGE" ] || die "no stock image in $STOCK_DIR (statussign_*.upg). Copy it from the panel's stock system (vendor/firmware/) or give its path."
 fi
 [ -r "$IMAGE" ] || die "image not found: $IMAGE"
