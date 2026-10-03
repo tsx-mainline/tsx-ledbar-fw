@@ -15,10 +15,11 @@
  * In mode 3 an output is on for PWMx/256 of the 97 kHz individual period
  * and only inside the GRPPWM/256 window of the 190 Hz group period, so
  * its brightness is the product PWMx x GRPPWM. The LED engine uses both
- * (tlc_set_dim): the lowest step is then 1/65025 of full brightness, not
- * the 1/255 of GRPPWM alone, which shows as a jump in a dark room. MODE2
- * OCH = 0 makes the outputs change at the STOP condition, so the PWM and
- * GRPPWM bytes of one transfer take effect together.
+ * (one PWMx per output, one GRPPWM per chip): the lowest step is then
+ * 1/65025 of full brightness, not the 1/255 of GRPPWM alone, which shows
+ * as a jump in a dark room. MODE2 OCH = 0 makes the outputs change at the
+ * STOP condition, so the PWM and GRPPWM bytes of one transfer take effect
+ * together.
  *
  * The QEMU build has no I2C model: the chip registers are kept in RAM.
  */
@@ -28,8 +29,8 @@
 #define TLC_AUTOINC	0x80
 #define REG_MODE1	0x00
 #define REG_MODE2	0x01
-#define REG_PWM0	0x02
-#define REG_GRPPWM	0x12
+#define REG_PWM0	TLC_REG_PWM0
+#define REG_GRPPWM	TLC_REG_GRPPWM
 #define REG_GRPFREQ	0x13
 #define REG_LEDOUT0	0x14
 #define MODE2_DMBLNK	0x20
@@ -332,35 +333,15 @@ bool tlc_set_group_pwm(int color, uint8_t duty)
 	return tlc_ready(color) && tlc_write(color, REG_GRPPWM, &duty, 1);
 }
 
-/*
- * Brightness as PWMx (all 16 outputs the same) times GRPPWM. One
- * transfer writes PWM0..15 and GRPPWM (registers 0x02..0x12) when the
- * PWM value changes, otherwise only GRPPWM is written.
- */
-bool tlc_set_dim(int color, uint8_t pwm, uint8_t grp)
-{
-	uint8_t v[17];
-	bool same = true;
-
-	if (!tlc_ready(color))
-		return false;
-	for (int i = 0; i < 16; i++)
-		same = same && shadow[color][REG_PWM0 + i] == pwm;
-	if (!same) {
-		for (int i = 0; i < 16; i++)
-			v[i] = pwm;
-		v[16] = grp;
-		return tlc_write(color, REG_PWM0, v, 17);
-	}
-	if (shadow[color][REG_GRPPWM] == grp)
-		return true;
-	return tlc_write(color, REG_GRPPWM, &grp, 1);
-}
-
 void tlc_get_dim(int color, uint8_t *pwm, uint8_t *grp)
 {
 	*pwm = shadow[color][REG_PWM0];
 	*grp = shadow[color][REG_GRPPWM];
+}
+
+uint8_t tlc_get_pwm(int color, int out)
+{
+	return shadow[color][REG_PWM0 + (out & 15)];
 }
 
 bool tlc_set_group_blink(int color, bool blink, uint8_t freq)

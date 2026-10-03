@@ -1,26 +1,54 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * LED engine. It runs every 10 ms and writes the brightness of a color
- * (PWMx and GRPPWM, see tlc_set_dim) only when its duty changed.
+ * LED engine. It runs every 10 ms, keeps a level for each of the 16 LEDs
+ * and each color, and writes the chip registers only when they change.
+ *
+ * LED index (tsx.h): 0..7 are R1..R8, the right side from top to bottom.
+ * 8..15 are L1..L8, the left side from top to bottom. led_out[] maps an
+ * index to the TLC59116 output. Output n of the red, green and blue chip
+ * drives the same LED.
  *
  * Host model (as the stock firmware): a color lights while its digital
  * join is on, at its analog join level 0..100. A blink time (analog joins
- * 0..2, 100 ms units) toggles the color. Host changes can be smoothed:
- * "smooth" is the ramp time between two host colors (0 = at once).
+ * 0..2, 100 ms units) toggles the color. The host color goes to all 16
+ * LEDs.
  *
- * Effects run on top of the host color until FX OFF or until the host
- * sends a new join. FADE goes to a color over a time and holds it. BLINK,
- * BREATHE and RAINBOW repeat until they are stopped.
+ * Base: the bar shows the host color or, after a LED command on the
+ * console, the LED pattern (a level for each LED and color). The first
+ * LED command copies the steady host color into the pattern. LED CLEAR
+ * and every host join drop the pattern. "smooth" is the ramp time
+ * between two base colors (0 = at once).
+ *
+ * Effects run on top of the base until FX OFF, a LED command or a host
+ * join. FX OFF ramps back to the base: the pattern when one is set,
+ * otherwise the host color. A host join drops the pattern and the effect
+ * and ramps to the host color. FADE, FILL and SPLIT go to a color (FADE
+ * over its own time, FILL and SPLIT over the smooth time) and hold it.
+ * BLINK, BREATHE, RAINBOW, CHASE and SPECTRUM repeat until they stop.
  *
  * Color math: a level 0..100 is a lightness. It maps to a duty 0..65535
  * of full brightness with the CIE 1976 lightness curve, so a linear fade
  * in level looks linear, and the curve is linear near zero, so a fade
  * does not dwell at the bottom. Ramps and effects work in level units
  * with 8 fraction bits, and the duty is interpolated between the table
- * entries. The duty goes to the chips as PWMx x GRPPWM (tlc_set_dim),
- * so the lowest step is 1/65025 of full brightness. A power cap keeps the
- * sum of the three duties at or below "cap" percent of one full channel
- * (default 110, the total the stock firmware allows).
+ * entries.
+ *
+ * Power cap: the sum of the 48 duties stays at or below "cap" percent of
+ * one full channel on all 16 LEDs (16 x 65535). The default 110 is the
+ * total the stock firmware allows. When the sum is above the cap, all
+ * duties scale by the same factor. With one color on the whole bar, this
+ * gives the same duties as the cap of 0.1.2 (sum of the three duties at
+ * or below 110 % of 65535).
+ *
+ * Dimming: brightness on the chip is PWMx x GRPPWM (see i2c_tlc.c), with
+ * one PWMx per output and one GRPPWM per chip. GRPPWM is the smallest
+ * value that still lets the brightest output of the chip reach its duty
+ * with PWMx <= 255. The step of every output is then GRPPWM / 65025 of
+ * full brightness, the smallest possible, so the darkest lit LED keeps
+ * fine steps. When the whole bar is dark, the chip is dark at the finest
+ * step: a single dim LED gets GRPPWM 1 and steps of 1/65025. One transfer
+ * writes the registers from the first changed one to the last changed
+ * one, so PWMx and GRPPWM change together at the STOP condition.
  */
 #include <string.h>
 #include "tsx.h"
@@ -29,16 +57,25 @@
 #define FP		256		/* 8 fraction bits, level units */
 #define LEVEL_MAX	(100 * FP)
 
-enum fx { FX_NONE, FX_FADE, FX_BLINK, FX_BREATHE, FX_RAINBOW, FX_DIRECT };
+/* LED index to TLC59116 output, see the comment at the top */
+static const uint8_t led_out[NLEDS] = {
+	15, 6, 0, 1, 2, 3, 4, 5,	/* R1..R8 */
+	14, 13, 12, 11, 10, 9, 8, 7,	/* L1..L8 */
+};
+
+enum fx {
+	FX_NONE, FX_FADE, FX_BLINK, FX_BREATHE, FX_RAINBOW, FX_DIRECT,
+	FX_CHASE, FX_FILL, FX_SPECTRUM, FX_SPLIT,
+};
 
 static struct led_state st;
 static uint32_t smooth_ms;
 static unsigned cap_percent = 110;
 
-static int32_t cur[NCOLORS];		/* current level, FP */
-static int32_t ramp_from[NCOLORS], ramp_to[NCOLORS];
+static int32_t cur[NLEDS][NCOLORS];	/* current level, FP */
+static int32_t ramp_from[NLEDS][NCOLORS], ramp_to[NLEDS][NCOLORS];
 static uint32_t ramp_start, ramp_ms;
-static int32_t host_target[NCOLORS];	/* last host target, to detect changes */
+static int32_t base_target[NLEDS][NCOLORS];	/* last base target, to detect changes */
 
 static enum fx fx;
 static uint8_t fx_rgb[NCOLORS];
@@ -46,6 +83,9 @@ static uint32_t fx_t0, fx_a, fx_b;
 static uint8_t fx_level;
 static uint16_t direct_duty[NCOLORS];
 static uint32_t last_tick;
+
+/* the registers PWM0..15 and GRPPWM as the engine last wrote them */
+static uint8_t sent[NCOLORS][TLC_DIM_REGS];
 
 /* CIE 1976: Y = L / 903.3 for L <= 8, else ((L + 16) / 116)^3, x 65535 */
 static const uint16_t cie_table[101] = {
@@ -64,7 +104,8 @@ static const uint16_t cie_table[101] = {
 
 #ifdef TSX_QEMU
 #include <stdio.h>
-bool leds_trace;
+bool leds_trace;	/* TRACE ON: one "led" line per tick */
+bool leds_trace_pix;	/* TRACE PIX: also one "pix" line with the 48 duties */
 #endif
 
 static int32_t clamp(int32_t v, int32_t lo, int32_t hi)
@@ -83,6 +124,24 @@ static uint32_t level_to_duty(int32_t lvl)
 	a = cie_table[i];
 	b = cie_table[i < 100 ? i + 1 : 100];
 	return (uint32_t)(a + ((b - a) * f) / FP);
+}
+
+/* the inverse: the level in FP units whose duty is d */
+static int32_t duty_to_level(uint32_t d)
+{
+	int lo = 0, hi = 100;
+
+	if (d >= 65535)
+		return LEVEL_MAX;
+	while (hi - lo > 1) {
+		int mid = (lo + hi) / 2;
+
+		if (cie_table[mid] <= d)
+			lo = mid;
+		else
+			hi = mid;
+	}
+	return lo * FP + (int32_t)((d - cie_table[lo]) * FP / (uint32_t)(cie_table[hi] - cie_table[lo]));
 }
 
 /*
@@ -105,24 +164,6 @@ static uint32_t breathe_curve(uint32_t phase)
 	return half_cos[i] + (uint32_t)((int32_t)(half_cos[i + 1] - half_cos[i]) * (int32_t)f / 64);
 }
 
-/*
- * Duty 0..65535 to PWMx x GRPPWM. The target t is in units of 1/65025
- * (255 x 255). GRPPWM is the smallest value that still reaches t with
- * PWMx <= 255, so PWMx stays in 128..255 above the bottom and the
- * rounding error stays below 0.4 % of the duty.
- */
-static void duty_split(uint32_t duty, uint8_t *pwm, uint8_t *grp)
-{
-	uint32_t t = (duty * 65025U + 32767U) / 65535U, g, p;
-
-	if (t == 0)
-		t = 1;
-	g = (t + 254) / 255;
-	p = (t + g / 2) / g;
-	*grp = (uint8_t)g;
-	*pwm = (uint8_t)(p > 255 ? 255 : p == 0 ? 1 : p);
-}
-
 /* hue 0..1535 (6 x 256), full saturation, value = level */
 static void hue_to_rgb(uint32_t hue, uint8_t level, int32_t out[NCOLORS])
 {
@@ -142,32 +183,67 @@ static void hue_to_rgb(uint32_t hue, uint8_t level, int32_t out[NCOLORS])
 	out[BLUE] = (int32_t)(b * level * FP / 255);
 }
 
+static void fill_all(int32_t out[NLEDS][NCOLORS], const int32_t rgb[NCOLORS])
+{
+	for (int i = 0; i < NLEDS; i++)
+		memcpy(out[i], rgb, sizeof(out[i]));
+}
+
+/*
+ * TLCRESET puts the chips back to their init values. Take the chip
+ * registers as the sent state, so the next tick writes what differs.
+ */
+void leds_resync(void)
+{
+	for (int c = 0; c < NCOLORS; c++) {
+		for (int o = 0; o < 16; o++)
+			sent[c][o] = tlc_get_pwm(c, o);
+		tlc_get_dim(c, &sent[c][0], &sent[c][16]);
+	}
+}
+
 void leds_init(void)
 {
 	memset(&st, 0, sizeof(st));
 	fx = FX_NONE;
 	tlc_init();
+	leds_resync();		/* PWMx 255 and GRPPWM 0 after the init */
 }
 
-static void host_color(int32_t out[NCOLORS])
+/* steady host level of each color (no blink), 0..100 */
+static void host_steady(uint8_t rgb[NCOLORS])
+{
+	for (int c = 0; c < NCOLORS; c++)
+		rgb[c] = st.control[c] ? st.level[c] : 0;
+}
+
+/* the base color of every LED: the pattern, or the host color with blink */
+static void base_color(int32_t out[NLEDS][NCOLORS])
 {
 	uint32_t now = millis();
+	int32_t host[NCOLORS];
 
+	if (st.pattern_on) {
+		for (int i = 0; i < NLEDS; i++) {
+			for (int c = 0; c < NCOLORS; c++)
+				out[i][c] = st.pattern[i][c] * FP;
+		}
+		return;
+	}
 	for (int c = 0; c < NCOLORS; c++) {
 		bool on = st.control[c];
 
 		if (on && st.blink_100ms[c])
 			on = ((now / (st.blink_100ms[c] * 100U)) & 1) == 0;
-		out[c] = on ? st.level[c] * FP : 0;
+		host[c] = on ? st.level[c] * FP : 0;
 	}
+	fill_all(out, host);
 }
 
-static void start_ramp(const int32_t to[NCOLORS], uint32_t ms)
+static void start_ramp(int32_t to[NLEDS][NCOLORS], uint32_t ms)
 {
-	for (int c = 0; c < NCOLORS; c++) {
-		ramp_from[c] = cur[c];
-		ramp_to[c] = to[c];
-	}
+	memcpy(ramp_from, cur, sizeof(cur));
+	memcpy(ramp_to, to, sizeof(ramp_to));
 	ramp_start = millis();
 	ramp_ms = ms;
 }
@@ -176,39 +252,105 @@ static void run_ramp(void)
 {
 	uint32_t t = millis() - ramp_start;
 
-	for (int c = 0; c < NCOLORS; c++) {
-		if (ramp_ms == 0 || t >= ramp_ms)
-			cur[c] = ramp_to[c];
-		else
-			cur[c] = ramp_from[c] + (int32_t)((int64_t)(ramp_to[c] - ramp_from[c]) * (int32_t)t / (int32_t)ramp_ms);
+	for (int i = 0; i < NLEDS; i++) {
+		for (int c = 0; c < NCOLORS; c++) {
+			int32_t a = ramp_from[i][c], b = ramp_to[i][c];
+
+			if (ramp_ms == 0 || t >= ramp_ms)
+				cur[i][c] = b;
+			else
+				cur[i][c] = a + (int32_t)((int64_t)(b - a) * (int32_t)t / (int32_t)ramp_ms);
+		}
 	}
+}
+
+/*
+ * Duties of one chip to its 17 registers. A duty d is the target
+ * t = d x 65025 / 65535 in units of 1/65025. GRPPWM g = ceil(tmax / 255),
+ * PWMx = t / g rounded, at least 1 for a lit output. For one color on all
+ * outputs this is the split of 0.1.2. A dark chip keeps its PWMx values
+ * and gets GRPPWM 0, so it needs a one-byte write.
+ */
+static void chip_regs(uint32_t duty[NLEDS][NCOLORS], int c, uint8_t v[TLC_DIM_REGS])
+{
+	uint32_t t[16], tmax = 0, g, p;
+
+	for (int i = 0; i < NLEDS; i++) {
+		uint32_t d = duty[i][c], x = 0;
+
+		if (d) {
+			x = (d * 65025U + 32767U) / 65535U;
+			if (x == 0)
+				x = 1;
+		}
+		t[led_out[i]] = x;
+		if (x > tmax)
+			tmax = x;
+	}
+	if (tmax == 0) {
+		memcpy(v, sent[c], 16);
+		v[16] = 0;
+		return;
+	}
+	g = (tmax + 254) / 255;
+	for (int o = 0; o < 16; o++) {
+		p = (t[o] + g / 2) / g;
+		v[o] = (uint8_t)(t[o] == 0 ? 0 : p > 255 ? 255 : p == 0 ? 1 : p);
+	}
+	v[16] = (uint8_t)g;
+}
+
+/* write the span of registers that changed, in one transfer */
+static bool chip_write(int c, const uint8_t v[TLC_DIM_REGS])
+{
+	int first = -1, last = -1;
+
+	for (int r = 0; r < TLC_DIM_REGS; r++) {
+		if (v[r] != sent[c][r]) {
+			if (first < 0)
+				first = r;
+			last = r;
+		}
+	}
+	if (first < 0)
+		return true;
+	if (!tlc_ready(c) ||
+	    !tlc_write(c, (uint8_t)(TLC_REG_PWM0 + first), v + first, (size_t)(last - first + 1)))
+		return false;
+	memcpy(sent[c], v, TLC_DIM_REGS);
+	return true;
 }
 
 static void apply(void)
 {
-	uint32_t duty[NCOLORS], sum = 0, cap = cap_percent * 65535U / 100U;
-	uint8_t pwm, grp;
-	bool ok;
+	uint32_t duty[NLEDS][NCOLORS];
+	uint64_t sum = 0, cap = (uint64_t)NLEDS * (cap_percent * 65535U / 100U);
+	uint8_t v[TLC_DIM_REGS];
 
-	for (int c = 0; c < NCOLORS; c++) {
-		duty[c] = fx == FX_DIRECT ? direct_duty[c] : level_to_duty(cur[c]);
-		sum += duty[c];
+	for (int i = 0; i < NLEDS; i++) {
+		for (int c = 0; c < NCOLORS; c++) {
+			duty[i][c] = fx == FX_DIRECT ? direct_duty[c] : level_to_duty(cur[i][c]);
+			sum += duty[i][c];
+		}
 	}
 	if (sum > cap) {
-		for (int c = 0; c < NCOLORS; c++)
-			duty[c] = (uint32_t)((uint64_t)duty[c] * cap / sum);
+		for (int i = 0; i < NLEDS; i++) {
+			for (int c = 0; c < NCOLORS; c++)
+				duty[i][c] = (uint32_t)((uint64_t)duty[i][c] * cap / sum);
+		}
 	}
 	for (int c = 0; c < NCOLORS; c++) {
-		if (duty[c] == st.duty[c])
-			continue;
-		if (duty[c] == 0) {
-			ok = tlc_set_group_pwm(c, 0);
-		} else {
-			duty_split(duty[c], &pwm, &grp);
-			ok = tlc_set_dim(c, pwm, grp);
+		uint32_t max = 0;
+
+		chip_regs(duty, c, v);
+		if (!chip_write(c, v))
+			continue;	/* the next tick tries again */
+		for (int i = 0; i < NLEDS; i++) {
+			st.led_duty[i][c] = (uint16_t)duty[i][c];
+			if (duty[i][c] > max)
+				max = duty[i][c];
 		}
-		if (ok)
-			st.duty[c] = (uint16_t)duty[c];
+		st.duty[c] = (uint16_t)max;
 	}
 #ifdef TSX_QEMU
 	if (leds_trace) {
@@ -218,13 +360,64 @@ static void apply(void)
 			 st.duty[0], st.duty[1], st.duty[2]);
 		qemu_uart_write(line);
 	}
+	if (leds_trace_pix) {
+		char line[16];
+
+		snprintf(line, sizeof(line), "pix %lu", (unsigned long)millis());
+		qemu_uart_write(line);
+		for (int i = 0; i < NLEDS; i++) {
+			for (int c = 0; c < NCOLORS; c++) {
+				snprintf(line, sizeof(line), " %u", st.led_duty[i][c]);
+				qemu_uart_write(line);
+			}
+		}
+		qemu_uart_write("\r\n");
+	}
 #endif
+}
+
+/* CHASE: a dot runs down both sides, a cross-fade between two rows */
+static void run_chase(uint32_t now)
+{
+	uint32_t pos = (now - fx_t0) % fx_a * (NROWS * 256U) / fx_a;	/* 0..2047 */
+
+	for (int r = 0; r < NROWS; r++) {
+		int32_t d = (int32_t)pos - r * 256;
+		uint32_t k;
+
+		if (d < 0)
+			d = -d;
+		if (d > NROWS * 128)
+			d = NROWS * 256 - d;		/* the dot wraps from the bottom to the top */
+		k = d >= 256 ? 0 : 256U - (uint32_t)d;	/* 0..256 */
+		for (int c = 0; c < NCOLORS; c++) {
+			/* share the light, not the lightness, so the sum stays the same */
+			int32_t l = duty_to_level(level_to_duty(fx_rgb[c] * FP) * k / 256U);
+
+			cur[r][c] = l;
+			cur[NROWS + r][c] = l;
+		}
+	}
+}
+
+/* SPECTRUM: the hue circle over the 8 rows of each side, moving down */
+static void run_spectrum(uint32_t now)
+{
+	uint32_t phase = (now - fx_t0) % fx_a * 1536U / fx_a;
+
+	for (int r = 0; r < NROWS; r++) {
+		uint32_t hue = (r * (1536U / NROWS) + 1536U - phase) % 1536U;
+
+		hue_to_rgb(hue, fx_level, cur[r]);
+		memcpy(cur[NROWS + r], cur[r], sizeof(cur[r]));
+	}
 }
 
 void leds_tick(void)
 {
 	uint32_t now = millis();
-	int32_t target[NCOLORS];
+	int32_t target[NLEDS][NCOLORS];
+	int32_t one[NCOLORS];
 
 	if (now - last_tick < TICK_MS)
 		return;
@@ -232,21 +425,24 @@ void leds_tick(void)
 
 	switch (fx) {
 	case FX_NONE:
-		host_color(target);
-		if (memcmp(target, host_target, sizeof(target)) != 0) {
-			memcpy(host_target, target, sizeof(target));
+		base_color(target);
+		if (memcmp(target, base_target, sizeof(target)) != 0) {
+			memcpy(base_target, target, sizeof(target));
 			start_ramp(target, smooth_ms);
 		}
 		run_ramp();
 		break;
 	case FX_FADE:
+	case FX_FILL:
+	case FX_SPLIT:
 		run_ramp();
 		break;
 	case FX_BLINK: {
 		uint32_t t = (now - fx_t0) % (fx_a + fx_b);
 
 		for (int c = 0; c < NCOLORS; c++)
-			cur[c] = t < fx_a ? fx_rgb[c] * FP : 0;
+			one[c] = t < fx_a ? fx_rgb[c] * FP : 0;
+		fill_all(cur, one);
 		break;
 	}
 	case FX_BREATHE: {
@@ -254,15 +450,23 @@ void leds_tick(void)
 		uint32_t k = breathe_curve(phase);
 
 		for (int c = 0; c < NCOLORS; c++)
-			cur[c] = (int32_t)((uint32_t)(fx_rgb[c] * FP) * k / 65535U);
+			one[c] = (int32_t)((uint32_t)(fx_rgb[c] * FP) * k / 65535U);
+		fill_all(cur, one);
 		break;
 	}
 	case FX_RAINBOW: {
 		uint32_t hue = (now - fx_t0) % fx_a * 1536 / fx_a;
 
-		hue_to_rgb(hue, fx_level, cur);
+		hue_to_rgb(hue, fx_level, one);
+		fill_all(cur, one);
 		break;
 	}
+	case FX_CHASE:
+		run_chase(now);
+		break;
+	case FX_SPECTRUM:
+		run_spectrum(now);
+		break;
 	case FX_DIRECT:
 		break;
 	}
@@ -270,15 +474,22 @@ void leds_tick(void)
 }
 
 /*
- * A host join ends an effect: the host is the master of the color. The
- * ramp goes back to the host color also when the join did not change that
- * color, because the effect left another color on the bar. Without an
- * effect, leds_tick starts a ramp when the host color changes.
+ * A host join drops the LED pattern and ends an effect: the host is the
+ * master of the color. The ramp goes back to the host color also when the
+ * join did not change that color, because the effect left another color
+ * on the bar. Without an effect, leds_tick starts a ramp when the base
+ * color changes.
  */
-static void host_update(void)
+static void end_effect(void)
 {
 	if (fx != FX_NONE && fx != FX_DIRECT)
 		leds_fx_off();
+}
+
+static void host_update(void)
+{
+	st.pattern_on = false;
+	end_effect();
 }
 
 void leds_set_level(int color, unsigned level)
@@ -310,22 +521,59 @@ const struct led_state *leds_state(void)
 	return &st;
 }
 
+int leds_output(int led)
+{
+	return led >= 0 && led < NLEDS ? led_out[led] : -1;
+}
+
+void leds_base_level(int led, uint8_t rgb[3])
+{
+	if (st.pattern_on)
+		memcpy(rgb, st.pattern[led], NCOLORS);
+	else
+		host_steady(rgb);
+}
+
+void leds_pattern_set(int first, int last, const uint8_t rgb[3])
+{
+	if (!st.pattern_on) {
+		uint8_t host[NCOLORS];
+
+		host_steady(host);
+		for (int i = 0; i < NLEDS; i++)
+			memcpy(st.pattern[i], host, NCOLORS);
+		st.pattern_on = true;
+	}
+	for (int i = first < 0 ? 0 : first; i <= last && i < NLEDS; i++) {
+		for (int c = 0; c < NCOLORS; c++)
+			st.pattern[i][c] = rgb[c] > 100 ? 100 : rgb[c];
+	}
+	end_effect();
+}
+
+void leds_pattern_clear(void)
+{
+	st.pattern_on = false;
+	end_effect();
+}
+
 void leds_fx_off(void)
 {
-	int32_t target[NCOLORS];
+	int32_t target[NLEDS][NCOLORS];
 
 	fx = FX_NONE;
-	host_color(target);
-	memcpy(host_target, target, sizeof(target));
+	base_color(target);
+	memcpy(base_target, target, sizeof(target));
 	start_ramp(target, smooth_ms);
 }
 
 void leds_fx_fade(const uint8_t rgb[3], uint32_t ms)
 {
-	int32_t to[NCOLORS];
+	int32_t to[NLEDS][NCOLORS], one[NCOLORS];
 
 	for (int c = 0; c < NCOLORS; c++)
-		to[c] = (rgb[c] > 100 ? 100 : rgb[c]) * FP;
+		one[c] = (rgb[c] > 100 ? 100 : rgb[c]) * FP;
+	fill_all(to, one);
 	fx = FX_FADE;
 	start_ramp(to, ms);
 }
@@ -355,6 +603,60 @@ void leds_fx_rainbow(uint32_t period_ms, uint8_t level)
 	fx = FX_RAINBOW;
 }
 
+void leds_fx_chase(const uint8_t rgb[3], uint32_t period_ms)
+{
+	for (int c = 0; c < NCOLORS; c++)
+		fx_rgb[c] = rgb[c] > 100 ? 100 : rgb[c];
+	fx_a = period_ms < 100 ? 100 : period_ms;
+	fx_t0 = millis();
+	fx = FX_CHASE;
+}
+
+/*
+ * FILL: a level bar from the bottom up on both sides. PERCENT 0..100
+ * covers the 8 rows. The top row of the bar gets the part of a row that
+ * is left, as a part of the level. A new FILL ramps over the smooth time.
+ */
+void leds_fx_fill(const uint8_t rgb[3], unsigned percent)
+{
+	int32_t to[NLEDS][NCOLORS];
+	int32_t fill = (int32_t)((percent > 100 ? 100 : percent) * NROWS * FP / 100U);
+
+	for (int r = 0; r < NROWS; r++) {
+		int32_t part = clamp(fill - (NROWS - 1 - r) * FP, 0, FP);	/* 0..FP */
+
+		for (int c = 0; c < NCOLORS; c++) {
+			to[r][c] = (rgb[c] > 100 ? 100 : rgb[c]) * part;
+			to[NROWS + r][c] = to[r][c];
+		}
+	}
+	fx = FX_FILL;
+	start_ramp(to, smooth_ms);
+}
+
+void leds_fx_spectrum(uint32_t period_ms, uint8_t level)
+{
+	fx_a = period_ms < 100 ? 100 : period_ms;
+	fx_level = level > 100 ? 100 : level;
+	fx_t0 = millis();
+	fx = FX_SPECTRUM;
+}
+
+/* SPLIT: one color on the right side, one on the left side */
+void leds_fx_split(const uint8_t right[3], const uint8_t left[3])
+{
+	int32_t to[NLEDS][NCOLORS];
+
+	for (int r = 0; r < NROWS; r++) {
+		for (int c = 0; c < NCOLORS; c++) {
+			to[r][c] = (right[c] > 100 ? 100 : right[c]) * FP;
+			to[NROWS + r][c] = (left[c] > 100 ? 100 : left[c]) * FP;
+		}
+	}
+	fx = FX_SPLIT;
+	start_ramp(to, smooth_ms);
+}
+
 void leds_set_smooth(uint32_t ms)
 {
 	smooth_ms = ms > 60000 ? 60000 : ms;
@@ -367,7 +669,10 @@ uint32_t leds_get_smooth(void)
 
 const char *leds_fx_name(void)
 {
-	static const char *const names[] = { "off", "fade", "blink", "breathe", "rainbow", "direct" };
+	static const char *const names[] = {
+		"off", "fade", "blink", "breathe", "rainbow", "direct",
+		"chase", "fill", "spectrum", "split",
+	};
 
 	return names[fx];
 }

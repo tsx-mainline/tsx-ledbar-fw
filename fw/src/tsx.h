@@ -16,6 +16,15 @@
 
 enum { RED, GREEN, BLUE, NCOLORS };
 
+/*
+ * The bar has 16 RGB LEDs, 8 on each side. Output n of the red, green and
+ * blue chip drives the same LED. The LED index counts by position: 0..7
+ * are R1..R8 (right side, top to bottom), 8..15 are L1..L8 (left side,
+ * top to bottom). leds.c holds the map from the index to the output.
+ */
+#define NLEDS		16
+#define NROWS		8
+
 /* board.c */
 void board_init(void);
 uint32_t millis(void);
@@ -48,8 +57,12 @@ bool tlc_ready(int color);
 bool tlc_write(int color, uint8_t reg, const uint8_t *data, size_t n);
 bool tlc_read(int color, uint8_t reg, uint8_t *data, size_t n);
 bool tlc_set_group_pwm(int color, uint8_t duty);
-bool tlc_set_dim(int color, uint8_t pwm, uint8_t grp);	/* brightness PWM x GRPPWM */
-void tlc_get_dim(int color, uint8_t *pwm, uint8_t *grp);
+/* PWM0..PWM15 and GRPPWM are 17 registers in a row, written in one transfer */
+#define TLC_REG_PWM0		0x02
+#define TLC_REG_GRPPWM		0x12
+#define TLC_DIM_REGS		17
+void tlc_get_dim(int color, uint8_t *pwm, uint8_t *grp);	/* PWM0 and GRPPWM */
+uint8_t tlc_get_pwm(int color, int out);
 bool tlc_set_group_blink(int color, bool blink, uint8_t freq);
 bool tlc_set_out_mode(int color, int out, int mode);	/* out 0..15 or -1 = all */
 bool tlc_set_pwm(int color, int out, uint8_t duty);
@@ -61,7 +74,10 @@ struct led_state {
 	uint8_t level[NCOLORS];		/* host level 0..100 (analog join) */
 	bool control[NCOLORS];		/* host switch (digital join) */
 	uint16_t blink_100ms[NCOLORS];	/* stock blink time, 100 ms units */
-	uint16_t duty[NCOLORS];		/* last duty sent, 0..65535 of full */
+	uint16_t duty[NCOLORS];		/* highest LED duty sent, 0..65535 of full */
+	uint16_t led_duty[NLEDS][NCOLORS];	/* duty sent for each LED */
+	uint8_t pattern[NLEDS][NCOLORS];	/* LED pattern levels 0..100 */
+	bool pattern_on;		/* the pattern, not the host color, is the base */
 };
 void leds_init(void);
 void leds_tick(void);			/* run every ms from the main loop */
@@ -69,12 +85,22 @@ void leds_set_level(int color, unsigned level);
 void leds_set_control(int color, bool on);
 void leds_set_blink_time(int color, unsigned n100ms);
 const struct led_state *leds_state(void);
+int leds_output(int led);		/* TLC59116 output of LED index 0..15 */
+void leds_base_level(int led, uint8_t rgb[3]);	/* pattern or steady host level */
+/* the LED pattern: set LEDs first..last, or go back to the host color */
+void leds_pattern_set(int first, int last, const uint8_t rgb[3]);
+void leds_pattern_clear(void);
+void leds_resync(void);			/* after TLCRESET: write all registers again */
 /* effects */
 void leds_fx_off(void);
 void leds_fx_fade(const uint8_t rgb[3], uint32_t ms);
 void leds_fx_blink(const uint8_t rgb[3], uint32_t on_ms, uint32_t off_ms);
 void leds_fx_breathe(const uint8_t rgb[3], uint32_t period_ms);
 void leds_fx_rainbow(uint32_t period_ms, uint8_t level);
+void leds_fx_chase(const uint8_t rgb[3], uint32_t period_ms);
+void leds_fx_fill(const uint8_t rgb[3], unsigned percent);
+void leds_fx_spectrum(uint32_t period_ms, uint8_t level);
+void leds_fx_split(const uint8_t right[3], const uint8_t left[3]);
 void leds_set_smooth(uint32_t ms);
 uint32_t leds_get_smooth(void);
 const char *leds_fx_name(void);
