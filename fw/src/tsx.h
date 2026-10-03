@@ -20,7 +20,7 @@ enum { RED, GREEN, BLUE, NCOLORS };
  * The bar has 16 RGB LEDs, 8 on each side. Output n of the red, green and
  * blue chip drives the same LED. The LED index counts by position: 0..7
  * are R1..R8 (right side, top to bottom), 8..15 are L1..L8 (left side,
- * top to bottom). leds.c holds the map from the index to the output.
+ * top to bottom). ledmap.c holds the maps from the index to the output.
  */
 #define NLEDS		16
 #define NROWS		8
@@ -75,6 +75,17 @@ bool tlc_set_out_mode(int color, int out, int mode);	/* out 0..15 or -1 = all */
 bool tlc_set_pwm(int color, int out, uint8_t duty);
 int tlc_get_out_mode(int color, int out);
 void tlc_reset_pulse(void);
+
+/* ledmap.c: the board variant pins and the LED map */
+void ledmap_init(void);			/* read the variant pins, take the map of the value */
+unsigned ledmap_variant(void);		/* the value of the pins, 0..7 */
+bool ledmap_known(void);		/* the value has a map */
+const char *ledmap_name(void);		/* the map in use */
+bool ledmap_chosen(void);		/* LEDMAP selected the map, not the pins */
+const uint8_t *ledmap_outputs(void);	/* the map in use: output of LED index 0..15 */
+void ledmap_auto(void);			/* LEDMAP AUTO: the map of the pins */
+bool ledmap_select(const char *what);	/* LEDMAP N|NAME: false when there is no such map */
+void ledmap_each(void (*fn)(int, const char *));	/* each map: value (-1: none), name */
 
 /* leds.c: the LED engine */
 struct led_state {

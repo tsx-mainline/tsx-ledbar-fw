@@ -8,6 +8,10 @@
 #define GPIO6			(1 << 6)
 #define GPIO7			(1 << 7)
 #define GPIO12			(1 << 12)
+#define GPIO13			(1 << 13)
+#define GPIO14			(1 << 14)
+#define GPIO15			(1 << 15)
+#define GPIO_MODE_INPUT		0
 #define GPIO_MODE_OUTPUT	1
 #define GPIO_MODE_AF		2
 #define GPIO_PUPD_NONE		0

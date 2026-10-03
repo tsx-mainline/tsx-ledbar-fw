@@ -4,9 +4,10 @@
  * and each color, and writes the chip registers only when they change.
  *
  * LED index (tsx.h): 0..7 are R1..R8, the right side from top to bottom.
- * 8..15 are L1..L8, the left side from top to bottom. led_out[] maps an
- * index to the TLC59116 output. Output n of the red, green and blue chip
- * drives the same LED.
+ * 8..15 are L1..L8, the left side from top to bottom. The LED map
+ * (ledmap.c) gives the TLC59116 output of each index. Output n of the
+ * red, green and blue chip drives the same LED. The engine reads the map
+ * at each tick, so a new map (LEDMAP) shows at the next tick.
  *
  * Host model (as the stock firmware): a color lights while its digital
  * join is on, at its analog join level 0..100. A blink time (analog joins
@@ -96,12 +97,6 @@
 #define TICK_MS		10
 #define FP		256		/* 8 fraction bits, level units */
 #define LEVEL_MAX	(100 * FP)
-
-/* LED index to TLC59116 output, see the comment at the top */
-static const uint8_t led_out[NLEDS] = {
-	15, 6, 0, 1, 2, 3, 4, 5,	/* R1..R8 */
-	14, 13, 12, 11, 10, 9, 8, 7,	/* L1..L8 */
-};
 
 /*
  * The ring: the LED index in ring order, clockwise seen from the front.
@@ -503,6 +498,7 @@ static uint32_t grp_for(uint32_t tmax)
 /* the targets of one chip by output, t = d x 65025 / 65535, at least 1 when lit */
 static uint32_t chip_targets(uint32_t duty[NLEDS][NCOLORS], int c, uint32_t t[16])
 {
+	const uint8_t *led_out = ledmap_outputs();
 	uint32_t tmax = 0;
 
 	for (int i = 0; i < NLEDS; i++) {
@@ -881,7 +877,7 @@ const struct led_state *leds_state(void)
 
 int leds_output(int led)
 {
-	return led >= 0 && led < NLEDS ? led_out[led] : -1;
+	return led >= 0 && led < NLEDS ? ledmap_outputs()[led] : -1;
 }
 
 void leds_base_level(int led, uint8_t rgb[3])
