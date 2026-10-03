@@ -208,9 +208,17 @@ static void io_out_cb(usbd_device *d, uint8_t ep)
 		cresnet_rx(buf, (size_t)n);
 }
 
+/*
+ * SET_CONFIGURATION. The value 0 puts the device back in the address
+ * state: the library has reset the endpoints, and the firmware must stop
+ * the IN data. It is not a configuration for the guard either.
+ */
 static void set_config_cb(usbd_device *d, uint16_t wValue)
 {
-	(void)wValue;
+	if (wValue == 0) {
+		configured = false;
+		return;
+	}
 	usbd_ep_setup(d, EP_CONSOLE_OUT, USB_ENDPOINT_ATTR_BULK, EP_SIZE, console_out_cb);
 	usbd_ep_setup(d, EP_CONSOLE_IN, USB_ENDPOINT_ATTR_BULK, EP_SIZE, NULL);
 	usbd_ep_setup(d, EP_IO_OUT, USB_ENDPOINT_ATTR_BULK, EP_SIZE, io_out_cb);
