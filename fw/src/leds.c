@@ -49,14 +49,31 @@
  * it between rows, so a dot or a part of a row keeps its part of the light.
  *
  * Dimming: brightness on the chip is PWMx x GRPPWM (see i2c_tlc.c), with
- * one PWMx per output and one GRPPWM per chip. GRPPWM is the smallest
- * value that still lets the brightest output of the chip reach its duty
- * with PWMx <= 255. The step of every output is then GRPPWM / 65025 of
- * full brightness, the smallest possible, so the darkest lit LED keeps
- * fine steps. When the whole bar is dark, the chip is dark at the finest
- * step: a single dim LED gets GRPPWM 1 and steps of 1/65025. One transfer
- * writes the registers from the first changed one to the last changed
- * one, so PWMx and GRPPWM change together at the STOP condition.
+ * one PWMx per output and one GRPPWM per chip. PWMx runs at 97 kHz,
+ * GRPPWM is the duty of a free-running 190 Hz window. A GRPPWM write that
+ * lands inside the window can give that chip a wrong brightness for up to
+ * one window (5 ms). In 0.1.3 a mixed-color CHASE wrote a new GRPPWM on
+ * every tick and showed short one-color flashes. So GRPPWM changes only
+ * when the light of the chip changes by a large factor:
+ * 1. need = ceil(tmax / 255) is the smallest GRPPWM that still lets the
+ *    brightest output reach its duty with PWMx <= 255.
+ * 2. need > GRPPWM: raise GRPPWM to 1.5 x need (at most 255).
+ * 3. GRPPWM >= 4 x need (PWMx of the brightest output 64 or less): lower
+ *    GRPPWM by 1/8 (at least 1), but not below 1.5 x need. On the bar a
+ *    lower GRPPWM in one large step (2.5 to 3 times) showed as a short
+ *    flash, although PWMx x GRPPWM stayed continuous. Small steps, as in
+ *    BREATHE of 0.1.3, do not show.
+ * 4. Else keep GRPPWM, so only PWMx changes.
+ * PWMx = t / GRPPWM goes in the same transfer, so the light stays
+ * continuous at a change. The brightest output keeps PWMx near 64 or
+ * more, steps of about 1.6 % or finer. Light that changes inside a range
+ * of 2 (CHASE: the dot shares its light between two rows) or keeps its
+ * peak (SPECTRUM, FILL, SPLIT) runs on a constant GRPPWM. On the way down
+ * a BREATHE or a fade lowers GRPPWM in small steps through the low range.
+ * On the way up it raises GRPPWM about 7 times. A dark chip gets PWMx 0,
+ * and after one tick GRPPWM 1, so a dim start (the bottom of BREATHE)
+ * gets steps of 1/65025. One transfer writes the registers from the first
+ * changed one to the last changed one.
  */
 #include <string.h>
 #include "tsx.h"
@@ -105,6 +122,7 @@ static bool fx_limited;	/* CHASE, FILL: the per-LED limit scaled the effect colo
 
 /* the registers PWM0..15 and GRPPWM as the engine last wrote them */
 static uint8_t sent[NCOLORS][TLC_DIM_REGS];
+static uint32_t grp_changes[NCOLORS];	/* GRPPWM writes of the engine, for TLCREGS */
 
 /* CIE 1976: Y = L / 903.3 for L <= 8, else ((L + 16) / 116)^3, x 65535 */
 static const uint16_t cie_table[101] = {
@@ -125,6 +143,7 @@ static const uint16_t cie_table[101] = {
 #include <stdio.h>
 bool leds_trace;	/* TRACE ON: one "led" line per tick */
 bool leds_trace_pix;	/* TRACE PIX: also one "pix" line with the 48 duties */
+bool leds_trace_regs;	/* TRACE REGS: also one "reg" line with PWM0..15 and GRPPWM of each chip */
 #endif
 
 static int32_t clamp(int32_t v, int32_t lo, int32_t hi)
@@ -221,6 +240,12 @@ void leds_resync(void)
 	}
 }
 
+/* the number of GRPPWM changes the engine wrote to the chip since the start */
+uint32_t leds_grp_changes(int c)
+{
+	return c >= 0 && c < NCOLORS ? grp_changes[c] : 0;
+}
+
 void leds_init(void)
 {
 	memset(&st, 0, sizeof(st));
@@ -313,15 +338,31 @@ static void run_ramp(void)
 }
 
 /*
+ * GRPPWM rules, see the comment at the top. GRP_IDLE: a dark chip.
+ * grp_for(need): a raised GRPPWM, 1.5 x need. GRP_LOWER: lower GRPPWM
+ * only when it is this many times the need, by 1/8 per tick. GRP_LOWER must stay above
+ * 2 x 1.5, so light that changes inside a range of 2 does not change
+ * GRPPWM.
+ */
+#define GRP_IDLE	1
+#define GRP_LOWER	4
+
+static uint32_t grp_for(uint32_t need)
+{
+	uint32_t g = (3 * need + 1) / 2;
+
+	return g > 255 ? 255 : g;
+}
+
+/*
  * Duties of one chip to its 17 registers. A duty d is the target
- * t = d x 65025 / 65535 in units of 1/65025. GRPPWM g = ceil(tmax / 255),
- * PWMx = t / g rounded, at least 1 for a lit output. For one color on all
- * outputs this is the split of 0.1.2. A dark chip keeps its PWMx values
- * and gets GRPPWM 0, so it needs a one-byte write.
+ * t = d x 65025 / 65535 in units of 1/65025. GRPPWM g follows the rules
+ * at the top, PWMx = t / g rounded, at least 1 for a lit output.
  */
 static void chip_regs(uint32_t duty[NLEDS][NCOLORS], int c, uint8_t v[TLC_DIM_REGS])
 {
-	uint32_t t[16], tmax = 0, g, p;
+	uint32_t t[16], tmax = 0, g = sent[c][16], need, p;
+	bool dark = g == 0;
 
 	for (int i = 0; i < NLEDS; i++) {
 		uint32_t d = duty[i][c], x = 0;
@@ -335,12 +376,26 @@ static void chip_regs(uint32_t duty[NLEDS][NCOLORS], int c, uint8_t v[TLC_DIM_RE
 		if (x > tmax)
 			tmax = x;
 	}
+	if (!dark) {
+		dark = true;
+		for (int o = 0; o < 16; o++)
+			dark = dark && sent[c][o] == 0;
+	}
+	memset(v, 0, 16);
 	if (tmax == 0) {
-		memcpy(v, sent[c], 16);
-		v[16] = 0;
+		/* dark since the last write: GRPPWM 1, so the next light is a raise */
+		v[16] = (uint8_t)(dark ? GRP_IDLE : g);
 		return;
 	}
-	g = (tmax + 254) / 255;
+	need = (tmax + 254) / 255;
+	if (need > g) {
+		g = grp_for(need);
+	} else if (g >= GRP_LOWER * need) {
+		/* at most 1/8 down in one tick: a large step down shows as a flash */
+		uint32_t lo = g - (g + 7) / 8;
+
+		g = lo > grp_for(need) ? lo : grp_for(need);
+	}
 	for (int o = 0; o < 16; o++) {
 		p = (t[o] + g / 2) / g;
 		v[o] = (uint8_t)(t[o] == 0 ? 0 : p > 255 ? 255 : p == 0 ? 1 : p);
@@ -365,6 +420,8 @@ static bool chip_write(int c, const uint8_t v[TLC_DIM_REGS])
 	if (!tlc_ready(c) ||
 	    !tlc_write(c, (uint8_t)(TLC_REG_PWM0 + first), v + first, (size_t)(last - first + 1)))
 		return false;
+	if (v[16] != sent[c][16])
+		grp_changes[c]++;
 	memcpy(sent[c], v, TLC_DIM_REGS);
 	return true;
 }
@@ -406,21 +463,36 @@ static void apply(void)
 		st.duty[c] = (uint16_t)max;
 	}
 #ifdef TSX_QEMU
+	unsigned long ms = (unsigned long)millis();	/* one time for the lines of this tick */
+
 	if (leds_trace) {
 		char line[48];
 
-		snprintf(line, sizeof(line), "led %lu %u %u %u\r\n", (unsigned long)millis(),
+		snprintf(line, sizeof(line), "led %lu %u %u %u\r\n", ms,
 			 st.duty[0], st.duty[1], st.duty[2]);
 		qemu_uart_write(line);
 	}
 	if (leds_trace_pix) {
 		char line[16];
 
-		snprintf(line, sizeof(line), "pix %lu", (unsigned long)millis());
+		snprintf(line, sizeof(line), "pix %lu", ms);
 		qemu_uart_write(line);
 		for (int i = 0; i < NLEDS; i++) {
 			for (int c = 0; c < NCOLORS; c++) {
 				snprintf(line, sizeof(line), " %u", st.led_duty[i][c]);
+				qemu_uart_write(line);
+			}
+		}
+		qemu_uart_write("\r\n");
+	}
+	if (leds_trace_regs) {
+		char line[16];
+
+		snprintf(line, sizeof(line), "reg %lu", ms);
+		qemu_uart_write(line);
+		for (int c = 0; c < NCOLORS; c++) {
+			for (int r = 0; r < TLC_DIM_REGS; r++) {
+				snprintf(line, sizeof(line), " %u", sent[c][r]);
 				qemu_uart_write(line);
 			}
 		}

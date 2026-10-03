@@ -164,6 +164,7 @@ static void cmd_help(void)
 		"TLCGROUPMODE COLOR MODE   0 = group dimming, 1 = group blinking\r\n"
 		"TLCBRIGHTNESS COLOR NUM|GROUP PERCENT\r\n"
 		"TLCRESET                  reset and init the LED driver chips\r\n"
+		"TLCREGS COLOR             read the registers of a TLC59116\r\n"
 		"SELFTEST LED ON|OFF [COLOR|ALL] [PERCENT]\r\n"
 		"LED COLOR LEVEL|CONTROL|BLINK VALUE   the host joins, by hand\r\n"
 		"LED SET LEDS R G B        LEDS: R1..R8, L1..L8, 0..15, A-B, R, L or ALL\r\n"
@@ -252,6 +253,35 @@ static void cmd_tlc(int argc, char **argv)
 			ok = false;
 		console_printf("%s brightness %s\r\n", color_names[c], ok ? "set" : "failed");
 	}
+}
+
+/*
+ * TLCREGS COLOR: read registers 0x00..0x17 from the chip (not from the
+ * copy in RAM), and the number of GRPPWM changes the engine wrote.
+ */
+static void cmd_tlcregs(const char *arg)
+{
+	int c = arg ? color_arg(arg) : -1;
+	uint8_t r[0x18];
+
+	if (c < 0) {
+		console_write("usage: TLCREGS COLOR\r\n");
+		return;
+	}
+	if (!tlc_ready(c)) {
+		console_write("LED driver not initialized!\r\n");
+		return;
+	}
+	if (!tlc_read(c, 0, r, sizeof(r))) {
+		console_write("TLCREGS failed\r\n");
+		return;
+	}
+	console_printf("%s mode %02X %02X grp %u freq %u ledout %02X %02X %02X %02X grp changes %lu\r\n",
+		       color_names[c], r[0], r[1], r[0x12], r[0x13], r[0x14], r[0x15], r[0x16], r[0x17],
+		       (unsigned long)leds_grp_changes(c));
+	console_printf("%s pwm %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u\r\n", color_names[c],
+		       r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9],
+		       r[10], r[11], r[12], r[13], r[14], r[15], r[16], r[17]);
 }
 
 static void cmd_selftest(int argc, char **argv)
@@ -482,6 +512,8 @@ static void run_line(void)
 	} else if (eq(argv[0], "TLCRESET")) {
 		console_printf("TLC reset %s\r\n", tlc_init() ? "ok" : "FAILED");
 		leds_resync();
+	} else if (eq(argv[0], "TLCREGS")) {
+		cmd_tlcregs(argc > 1 ? argv[1] : NULL);
 	} else if (eq(argv[0], "TLCOUTMODE") || eq(argv[0], "TLCGROUPMODE") ||
 		   eq(argv[0], "TLCBRIGHTNESS")) {
 		if (argc < 3)
@@ -496,12 +528,17 @@ static void run_line(void)
 		cmd_fx(argc, argv);
 #ifdef TSX_QEMU
 	} else if (eq(argv[0], "TRACE")) {
-		extern bool leds_trace, leds_trace_pix;
+		extern bool leds_trace, leds_trace_pix, leds_trace_regs;
 
-		/* ON: "led MS R G B" per tick, PIX: also "pix MS" and 48 duties */
-		leds_trace_pix = argc > 1 && eq(argv[1], "PIX");
+		/*
+		 * ON: "led MS R G B" per tick, PIX: also "pix MS" and 48 duties,
+		 * REGS: also "reg MS" and PWM0..15 and GRPPWM of red, green, blue
+		 */
+		leds_trace_regs = argc > 1 && eq(argv[1], "REGS");
+		leds_trace_pix = leds_trace_regs || (argc > 1 && eq(argv[1], "PIX"));
 		leds_trace = leds_trace_pix || (argc > 1 && eq(argv[1], "ON"));
-		console_printf("trace %s\r\n", leds_trace_pix ? "pix" : leds_trace ? "on" : "off");
+		console_printf("trace %s\r\n", leds_trace_regs ? "regs" : leds_trace_pix ? "pix" :
+			       leds_trace ? "on" : "off");
 #endif
 	} else {
 		console_printf("unknown command: %s (HELP for a list)\r\n", argv[0]);

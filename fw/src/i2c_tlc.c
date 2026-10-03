@@ -17,9 +17,11 @@
  * its brightness is the product PWMx x GRPPWM. The LED engine uses both
  * (one PWMx per output, one GRPPWM per chip): the lowest step is then
  * 1/65025 of full brightness, not the 1/255 of GRPPWM alone, which shows
- * as a jump in a dark room. MODE2 OCH = 0 makes the outputs change at the
- * STOP condition, so the PWM and GRPPWM bytes of one transfer take effect
- * together.
+ * as a jump in a dark room. MODE2 OCH = 0 makes the registers change at
+ * the STOP condition. The 190 Hz group counter does not restart on a
+ * write, so a GRPPWM write inside the group window can give a wrong
+ * window for one period. The LED engine changes GRPPWM only when it must
+ * (see leds.c).
  *
  * The QEMU build has no I2C model: the chip registers are kept in RAM.
  */
