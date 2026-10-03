@@ -182,6 +182,18 @@ def main():
         check('chips ok ok ok' in out, 'STATUS shows the three chips ready')
         out = m.cmd('TLCOUTMODE RED 0')
         check('output mode is:3' in out, 'TLCOUTMODE answers like the stock firmware: %s' % out.strip())
+        out = m.cmd('TLCOUTMODE BLUE ALL')
+        check('BLUE -1 output mode is:3' in out, 'TLCOUTMODE COLOR ALL reads the mode: %s' % out.strip())
+        # the raw TLC write commands would skip the power limits: refused
+        regs = [m.cmd('TLCREGS %s' % c) for c in ('RED', 'GREEN', 'BLUE')]
+        for line in ('TLCOUTMODE RED ALL 1', 'TLCOUTMODE GREEN 3 2', 'TLCOUTMODE BLUE 0 0',
+                     'TLCGROUPMODE BLUE 1', 'TLCGROUPMODE RED 0',
+                     'TLCBRIGHTNESS RED 5 100', 'TLCBRIGHTNESS GREEN GROUP 100'):
+            out = m.cmd(line)
+            check('refused' in out, '%s is refused: %s' % (line, out.strip()))
+        after = [m.cmd('TLCREGS %s' % c) for c in ('RED', 'GREEN', 'BLUE')]
+        check(after == regs and all('mode 80 00' in r and 'ledout FF FF FF FF' in r for r in after),
+              'the refused commands leave the chip registers as they were')
         out = m.cmd('NOSUCH')
         check('unknown command' in out, 'unknown command is reported')
         out = m.cmd('ERRLOG')

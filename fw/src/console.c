@@ -160,9 +160,8 @@ static void cmd_help(void)
 		"ERRLOG | CLEARERR         error log\r\n"
 		"REBOOT                    restart the application\r\n"
 		"IMGUPD                    restart into the bootloader (USB update mode)\r\n"
-		"TLCOUTMODE COLOR NUM MODE output mode of a TLC59116 output (NUM 0-15 or ALL)\r\n"
-		"TLCGROUPMODE COLOR MODE   0 = group dimming, 1 = group blinking\r\n"
-		"TLCBRIGHTNESS COLOR NUM|GROUP PERCENT\r\n"
+		"TLCOUTMODE COLOR NUM|ALL  output mode of a TLC59116 output\r\n"
+		"TLCOUTMODE COLOR NUM MODE, TLCGROUPMODE, TLCBRIGHTNESS   refused: use LED SET, FX\r\n"
 		"TLCRESET                  reset and init the LED driver chips\r\n"
 		"TLCREGS COLOR             read the registers of a TLC59116\r\n"
 		"SELFTEST LED ON|OFF [COLOR|ALL] [PERCENT]\r\n"
@@ -204,55 +203,44 @@ static void cmd_status(void)
 		       (unsigned long)guard_reset_flags(), errlog_count());
 }
 
+/*
+ * The stock TLC commands. The LED engine owns the chip registers: it
+ * applies the per-LED limit and the bar cap, and it keeps a copy of the
+ * registers it wrote. A raw write would skip both limits (LEDOUT mode 1 is
+ * fully on, blink mode runs on PWMx alone, a raw PWMx or GRPPWM skips the
+ * limits), and the copy would no longer match the chip. So only the read
+ * form runs: TLCOUTMODE COLOR NUM|ALL shows the output mode, as the stock
+ * firmware does (tsx-ledbard reads it). The write forms answer "refused".
+ * LED SET and FX set the light.
+ */
 static void cmd_tlc(int argc, char **argv)
 {
-	long v, n;
-	int c = color_arg(argv[1]);
+	long n;
+	int out, c = color_arg(argv[1]);
 
 	if (c < 0) {
 		console_write("usage: see HELP\r\n");
+		return;
+	}
+	if (!eq(argv[0], "TLCOUTMODE") || argc > 3) {
+		console_printf("%s refused: the LED engine sets the chip registers, with the power limits. "
+			       "Use LED SET or FX\r\n", argv[0]);
 		return;
 	}
 	if (!tlc_ready(c)) {
 		console_write("LED driver not initialized!\r\n");
 		return;
 	}
-	if (eq(argv[0], "TLCOUTMODE")) {
-		int out = eq(argv[2], "ALL") ? -1 : -2;
-
-		if (out == -2 && (!num_arg(argv[2], 0, 15, &n) || (out = (int)n) < 0)) {
-			console_write("usage: TLCOUTMODE COLOR NUM|ALL [MODE]\r\n");
-			return;
-		}
-		if (argc > 3) {
-			if (!num_arg(argv[3], 0, 3, &v) || !tlc_set_out_mode(c, out, (int)v)) {
-				console_write("TLCOUTMODE failed\r\n");
-				return;
-			}
-		}
-		console_printf("%s %d output mode is:%d\r\n", color_names[c], out,
-			       tlc_get_out_mode(c, out < 0 ? 0 : out));
-	} else if (eq(argv[0], "TLCGROUPMODE")) {
-		if (!num_arg(argv[2], 0, 1, &v) || !tlc_set_group_blink(c, v == 1, 0)) {
-			console_write("usage: TLCGROUPMODE COLOR 0|1\r\n");
-			return;
-		}
-		console_printf("%s group mode is:%ld\r\n", color_names[c], v);
-	} else if (eq(argv[0], "TLCBRIGHTNESS")) {
-		bool ok;
-
-		if (!num_arg(argv[3], 0, 100, &v)) {
-			console_write("usage: TLCBRIGHTNESS COLOR NUM|GROUP PERCENT\r\n");
-			return;
-		}
-		if (eq(argv[2], "GROUP"))
-			ok = tlc_set_group_pwm(c, (uint8_t)(v * 255 / 100));
-		else if (num_arg(argv[2], 0, 15, &n))
-			ok = tlc_set_pwm(c, (int)n, (uint8_t)(v * 255 / 100));
-		else
-			ok = false;
-		console_printf("%s brightness %s\r\n", color_names[c], ok ? "set" : "failed");
+	if (eq(argv[2], "ALL")) {
+		out = -1;
+	} else if (num_arg(argv[2], 0, 15, &n)) {
+		out = (int)n;
+	} else {
+		console_write("usage: TLCOUTMODE COLOR NUM|ALL\r\n");
+		return;
 	}
+	console_printf("%s %d output mode is:%d\r\n", color_names[c], out,
+		       tlc_get_out_mode(c, out < 0 ? 0 : out));
 }
 
 /*
