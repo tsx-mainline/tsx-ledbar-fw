@@ -220,6 +220,28 @@ class FakeAppBar:
         self.closed = True
 
 
+class FakeConsoleBar:
+    """A bar in application mode that answers console commands from a table"""
+    sysname, devnode, pid, is_app = '1-1', '/dev/bus/usb/001/002', '001b', True
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.sent = []
+
+    def open(self, iface=0):
+        return self
+
+    def close(self):
+        pass
+
+    def string(self, idx):
+        return {1: 'Crestron Electronics Inc.', 2: 'IO Processor', 3: '0'}.get(idx, self.answers['VER'].strip())
+
+    def command(self, line, ms=1500):
+        self.sent.append(line)
+        return self.answers.get(line, '')
+
+
 class FakeService:
     def __init__(self, keep):
         self.stopped = False
@@ -283,6 +305,33 @@ class Fallback(unittest.TestCase):
         self.assertEqual(service.starts, 0)
         self.assertIn('stays stopped', out)
         self.assertIn('rc-service tsx-ledbar start', out)
+
+
+class Info(unittest.TestCase):
+    def run_info(self, answers):
+        bar = FakeConsoleBar(answers)
+        out = io.StringIO()
+        with mock.patch.object(flash.Bar, 'find', staticmethod(lambda: bar)), contextlib.redirect_stdout(out):
+            flash.cmd_info(argparse.Namespace())
+        return bar.sent, out.getvalue()
+
+    def test_board_variant(self):
+        sent, out = self.run_info({
+            'VER': 'TSX-LEDBAR [v0.1.4]\r\n',
+            'CAPS': 'tsx-ledbar fade blink leds16 split ledmap\r\n',
+            'LEDMAP': 'variant 5 unknown map outputs auto\r\nmap 1 TSW-1060-LB\r\nmap - outputs\r\n'})
+        self.assertEqual(sent, ['VER', 'CAPS', 'LEDMAP'])
+        self.assertIn('board     variant 5 unknown map outputs auto\n', out)
+        self.assertNotIn('map - outputs', out)
+
+    def test_firmware_without_ledmap(self):
+        sent, out = self.run_info({'VER': 'TSX-LEDBAR [v0.1.3]\r\n', 'CAPS': 'tsx-ledbar fade leds16\r\n'})
+        self.assertEqual(sent, ['VER', 'CAPS'])
+        self.assertNotIn('board ', out)
+
+    def test_stock_firmware(self):
+        sent, out = self.run_info({'VER': 'STOCK-LB [v1.3443.00018, #FFFFFFFF]\r\nSTOCK-LB>'})
+        self.assertEqual(sent, ['VER'])
 
 
 if __name__ == '__main__':

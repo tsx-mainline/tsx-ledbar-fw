@@ -462,7 +462,11 @@ def cmd_info(args):
             text = bar.command('VER', 1000)
             show_text(text, 'ver       ')
             if 'TSX-LEDBAR' in text:
-                show_text(bar.command('CAPS', 1000), 'caps      ')
+                caps = bar.command('CAPS', 1000)
+                show_text(caps, 'caps      ')
+                if 'ledmap' in caps.split():
+                    # the board variant line: value, known or unknown, the LED map
+                    show_text(bar.command('LEDMAP', 1000).split('\n')[0], 'board     ')
         else:
             print('mode      bootloader')
     finally:
