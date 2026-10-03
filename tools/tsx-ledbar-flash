@@ -465,7 +465,7 @@ def cmd_info(args):
                 caps = bar.command('CAPS', 1000)
                 show_text(caps, 'caps      ')
                 if 'ledmap' in caps.split():
-                    # the board variant line: value, known or unknown, the LED map
+                    # the LED map line: the variant value, the map and its source
                     show_text(bar.command('LEDMAP', 1000).split('\n')[0], 'board     ')
         else:
             print('mode      bootloader')

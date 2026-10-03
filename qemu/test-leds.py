@@ -10,9 +10,10 @@ NEW.elf is the QEMU build under test. With REF.elf (the QEMU build of
 0.1.2), the script also sets the same host colors on both builds and
 compares the duties and the PWM and group values.
 
-The board variant: the default start reads value 1 (the map of the
-TSW-1060-LB). A second machine starts with value 5, which has no map: it
-uses the map "outputs". LEDMAP selects a map at run time on both.
+The LED map: the firmware starts with the map of the TSW-1060-LB. The
+default start reads the variant value 1. A second machine starts with
+value 5: the firmware only reports the value and uses the same map.
+LEDMAP selects a map at run time on both.
 
 TRACE PIX prints one line "pix MS" with the 48 duties (R1 red, green,
 blue, R2 red, ... L8 blue) after each engine tick. TRACE REGS also prints
@@ -858,34 +859,36 @@ def lit(pwm):
 
 
 def test_ledmap(m, variant):
-    """the outputs that a LED lights with the map of the pins, with LEDMAP
-    OUTPUTS and LEDMAP 1, and the per-LED limit with another map"""
+    """the outputs that a LED lights with the default map, with LEDMAP
+    outputs, LEDMAP TSW-1060-LB PANEL and LEDMAP DEFAULT, and the per-LED
+    limit with another map. The variant value does not change the map."""
     plain = list(range(16))
-    auto = OUTPUTS if variant == 1 else plain
-    name = 'TSW-1060-LB' if variant == 1 else 'outputs'
     out = m.cmd('STATUS')
-    check(re.search(r'variant %d %s map %s auto' % (variant, 'known' if variant == 1 else 'unknown', name), out),
-          'value %d: STATUS shows the variant and the map %s' % (variant, name))
+    check(re.search(r'variant %d map TSW-1060-LB default' % variant, out),
+          'value %d: STATUS shows the value and the default map' % variant)
     all_off(m)
     m.cmd('FX SMOOTH 0', 0.1)
     m.cmd('LED SET ALL 0 0 0', 0.3)
     m.cmd('LED SET R1 100 0 0', 0.4)
-    check(lit(chip_pwm(m, 'RED')) == [auto[0]], 'value %d: R1 red lights output %d: %s' % (
-        variant, auto[0], lit(chip_pwm(m, 'RED'))))
+    check(lit(chip_pwm(m, 'RED')) == [OUTPUTS[0]], 'value %d: R1 red lights output %d: %s' % (
+        variant, OUTPUTS[0], lit(chip_pwm(m, 'RED'))))
     m.cmd('LED SET R1 0 0 0', 0.2)
     m.cmd('LED SET L8 0 0 100', 0.4)
-    check(lit(chip_pwm(m, 'BLUE')) == [auto[15]] and lit(chip_pwm(m, 'RED')) == [],
-          'value %d: L8 blue lights output %d' % (variant, auto[15]))
-    for arg, outs, what in (('OUTPUTS', plain, 'outputs'), ('1', OUTPUTS, 'TSW-1060-LB'), ('AUTO', auto, name)):
+    check(lit(chip_pwm(m, 'BLUE')) == [OUTPUTS[15]] and lit(chip_pwm(m, 'RED')) == [],
+          'value %d: L8 blue lights output %d' % (variant, OUTPUTS[15]))
+    for arg, outs, what, src in (('outputs', plain, 'outputs', 'console'),
+                                 ('TSW-1060-LB PANEL', OUTPUTS, 'TSW-1060-LB', 'panel'),
+                                 ('OUTPUTS PANEL', plain, 'outputs', 'panel'),
+                                 ('DEFAULT', OUTPUTS, 'TSW-1060-LB', 'default')):
         out = m.cmd('LEDMAP %s' % arg, 0.4)
-        check(re.search(r'map %s %s' % (what, 'auto' if arg == 'AUTO' else 'console'), out),
-              'value %d, LEDMAP %s: map %s' % (variant, arg, what))
+        check(re.search(r'variant %d map %s %s' % (variant, what, src), out),
+              'value %d, LEDMAP %s: map %s %s' % (variant, arg, what, src))
         _, _, _, rows = led_get(m)
         check([rows.get(i, {}).get('out') for i in range(16)] == outs and rows.get(15, {}).get('level') == (0, 0, 100),
               'value %d, LEDMAP %s: LED GET outputs, the pattern stays' % (variant, arg))
         check(lit(chip_pwm(m, 'BLUE')) == [outs[15]], 'value %d, LEDMAP %s: L8 moves to output %d at the next tick: %s' % (
             variant, arg, outs[15], lit(chip_pwm(m, 'BLUE'))))
-    for arg, outs in (('OUTPUTS', plain), ('1', OUTPUTS)):
+    for arg, outs in (('outputs', plain), ('TSW-1060-LB PANEL', OUTPUTS)):
         m.cmd('LEDMAP %s' % arg, 0.1)
         m.cmd('FX SPLIT 100 0 0 0 0 100', 0.6)
         check(lit(chip_pwm(m, 'RED')) == sorted(outs[:8]) and lit(chip_pwm(m, 'BLUE')) == sorted(outs[8:]),
@@ -894,12 +897,12 @@ def test_ledmap(m, variant):
     # the per-LED limit does not depend on the map
     m.cmd('FX OFF', 0.2)
     m.cmd('LED SET ALL 0 0 0', 0.2)
-    m.cmd('LEDMAP OUTPUTS', 0.1)
+    m.cmd('LEDMAP outputs', 0.1)
     m.cmd('LED SET R3 100 100 100', 0.4)
     _, _, _, rows = led_get(m)
     check(rows.get(2, {}).get('duty') == (24029,) * 3 and rows[2].get('out') == 2 and lit(chip_pwm(m, 'GREEN')) == [2],
-          'value %d, LEDMAP OUTPUTS: one white LED R3 at the per-LED limit 24029 on output 2' % variant)
-    m.cmd('LEDMAP AUTO', 0.1)
+          'value %d, LEDMAP outputs: one white LED R3 at the per-LED limit 24029 on output 2' % variant)
+    m.cmd('LEDMAP DEFAULT', 0.1)
     all_off(m)
 
 

@@ -12,7 +12,8 @@ and the LED driver registers are kept in RAM. TRACE ON prints one line
 The netduino2 machine has no GPIO model. Machine(elf, variant=N) sets the
 board variant pins: a loader device writes 0x54535600 | N to RAM
 0x200000F0 before the start, and the QEMU build reads the value there.
-Without it the QEMU build reads value 1.
+Without it the QEMU build reads value 1. The firmware only reports the
+value.
 """
 import os
 import re
@@ -173,40 +174,48 @@ def test_guard(m):
     check(r is not None and r[1] == '00475055' and r[2] == 1, 'IMGUPD writes UPG and resets, the count stays: %s' % (r,))
 
 
-VARIANT_LINE = r'variant (\d) (known|unknown) map (\S+) (auto|console)'
+VARIANT_LINE = r'variant (\d) map (\S+) (default|panel|console)\r?\n'
+TSW1060 = [15, 6, 0, 1, 2, 3, 4, 5, 14, 13, 12, 11, 10, 9, 8, 7]
 
 
 def variant_of(text):
+    """the LED map line: (variant value, map, source), or None"""
     m = re.search(VARIANT_LINE, text)
-    return (int(m.group(1)), m.group(2), m.group(3), m.group(4)) if m else None
+    return (int(m.group(1)), m.group(2), m.group(3)) if m else None
 
 
 def test_ledmap_console(m):
-    """the board variant line and LEDMAP on the default start (value 1)"""
+    """the LED map line and LEDMAP on the default start (value 1)"""
     out = m.cmd('STATUS')
-    check(variant_of(out) == (1, 'known', 'TSW-1060-LB', 'auto'),
-          'STATUS: variant 1 known map TSW-1060-LB auto: %s' % (variant_of(out),))
+    check(variant_of(out) == (1, 'TSW-1060-LB', 'default'),
+          'STATUS: variant 1 map TSW-1060-LB default: %s' % (variant_of(out),))
     out = m.cmd('LEDMAP')
-    check(variant_of(out) == (1, 'known', 'TSW-1060-LB', 'auto') and 'map 1 TSW-1060-LB' in out
-          and 'map - outputs' in out, 'LEDMAP shows the variant line and the maps: %s' % out.strip().replace('\r\n', ' | '))
+    check(variant_of(out) == (1, 'TSW-1060-LB', 'default') and re.search(r'^maps TSW-1060-LB outputs\r?$', out, re.M),
+          'LEDMAP shows the map line and the maps: %s' % out.strip().replace('\r\n', ' | '))
     out = m.cmd('LEDMAP OUTPUTS')
-    check(variant_of(out) == (1, 'known', 'outputs', 'console'), 'LEDMAP OUTPUTS: %s' % out.strip())
-    check(variant_of(m.cmd('STATUS')) == (1, 'known', 'outputs', 'console'), 'STATUS shows the console choice')
-    out = m.cmd('LEDMAP 5')
-    check('no LED map 5' in out and 'map 1 TSW-1060-LB' in out, 'LEDMAP 5: no map, the list: %s' % out.strip().replace('\r\n', ' | '))
-    check(variant_of(m.cmd('STATUS'))[2] == 'outputs', 'a refused LEDMAP keeps the map')
-    for arg in ('9', 'XYZ', '-1'):
-        check('no LED map' in m.cmd('LEDMAP ' + arg), 'LEDMAP %s is refused' % arg)
-    out = m.cmd('LEDMAP tsw-1060-lb')
-    check(variant_of(out) == (1, 'known', 'TSW-1060-LB', 'console'), 'LEDMAP by name: %s' % out.strip())
-    out = m.cmd('LEDMAP AUTO')
-    check(variant_of(out) == (1, 'known', 'TSW-1060-LB', 'auto'), 'LEDMAP AUTO: %s' % out.strip())
+    check(variant_of(out) == (1, 'outputs', 'console') and 'maps' not in out, 'LEDMAP OUTPUTS: %s' % out.strip())
+    check(variant_of(m.cmd('STATUS')) == (1, 'outputs', 'console'), 'STATUS shows the console choice')
+    out = m.cmd('LEDMAP 1')
+    check('no LED map 1' in out and 'maps TSW-1060-LB outputs' in out,
+          'LEDMAP 1: no selection by the variant value, the list: %s' % out.strip().replace('\r\n', ' | '))
+    check(variant_of(m.cmd('STATUS')) == (1, 'outputs', 'console'), 'a refused LEDMAP keeps the map')
+    for arg in ('9', 'XYZ', 'AUTO', 'TSW-1060', 'PANEL'):
+        check('no LED map %s' % arg in m.cmd('LEDMAP ' + arg), 'LEDMAP %s is refused' % arg)
+    for arg in ('TSW-1060-LB CONSOLE', 'DEFAULT PANEL', 'TSW-1060-LB PANEL X'):
+        check('usage: LEDMAP' in m.cmd('LEDMAP ' + arg), 'LEDMAP %s: usage' % arg)
+    check(variant_of(m.cmd('STATUS')) == (1, 'outputs', 'console'), 'refused forms keep the map')
+    out = m.cmd('LEDMAP TSW-1060-LB PANEL')
+    check(variant_of(out) == (1, 'TSW-1060-LB', 'panel'), 'LEDMAP TSW-1060-LB PANEL: %s' % out.strip())
+    out = m.cmd('ledmap tsw-1060-lb')
+    check(variant_of(out) == (1, 'TSW-1060-LB', 'console'), 'ledmap tsw-1060-lb, not case-sensitive: %s' % out.strip())
+    out = m.cmd('LEDMAP DEFAULT')
+    check(variant_of(out) == (1, 'TSW-1060-LB', 'default'), 'LEDMAP DEFAULT: %s' % out.strip())
     check('LEDMAP' in m.cmd('HELP', 0.8), 'HELP lists LEDMAP')
 
 
 def test_variants(elf):
-    """a start with each value 0..7 on the variant pins: the map, and the
-    firmware runs as usual with an unknown value"""
+    """a start with each value 0..7 on the variant pins: STATUS reports the
+    value, and the firmware behaves the same with each value"""
     for v in range(8):
         m = Machine(elf, v)
         try:
@@ -215,12 +224,10 @@ def test_variants(elf):
                 check(False, 'value %d: the firmware starts: %s' % (v, text.strip()))
                 continue
             out = m.cmd('STATUS')
-            want = (v, 'known', 'TSW-1060-LB', 'auto') if v == 1 else (v, 'unknown', 'outputs', 'auto')
-            check(variant_of(out) == want and 'chips ok ok ok' in out,
+            check(variant_of(out) == (v, 'TSW-1060-LB', 'default') and 'chips ok ok ok' in out,
                   'value %d: STATUS %s, chips ok' % (v, variant_of(out)))
             outs = [int(x) for x in re.findall(r'^\d+ [RL][1-8] out (\d+) ', m.cmd('LED GET'), re.M)]
-            want_outs = [15, 6, 0, 1, 2, 3, 4, 5, 14, 13, 12, 11, 10, 9, 8, 7] if v == 1 else list(range(16))
-            check(outs == want_outs, 'value %d: LED GET outputs %s' % (v, outs))
+            check(outs == TSW1060, 'value %d: LED GET outputs of the default map %s' % (v, outs))
             if v in (0, 6):
                 check('TSX-LEDBAR [v' in m.cmd('VER') and m.cmd('ERRLOG').strip().startswith('0 errors'),
                       'value %d: VER answers, ERRLOG is empty' % v)
@@ -232,13 +239,13 @@ def test_variants(elf):
                 check(leds and leds[-1][1:] == (36044, 36044, 0),
                       'value %d: host joins and the power cap as usual: %s' % (v, leds[-1:]))
                 m.cmd('TRACE OFF')
-                out = m.cmd('LEDMAP 1')
-                check(variant_of(out) == (v, 'unknown', 'TSW-1060-LB', 'console'),
-                      'value %d: LEDMAP 1 uses the map of value 1: %s' % (v, variant_of(out)))
+                out = m.cmd('LEDMAP outputs PANEL')
+                check(variant_of(out) == (v, 'outputs', 'panel'),
+                      'value %d: LEDMAP outputs PANEL: %s' % (v, variant_of(out)))
                 m.send('REBOOT')
                 r = restart(m, 'REBOOT after LEDMAP')
-                check(r is not None and variant_of(m.cmd('STATUS')) == (v, 'unknown', 'outputs', 'auto'),
-                      'value %d: a restart forgets LEDMAP, the pins give the map again' % v)
+                check(r is not None and variant_of(m.cmd('STATUS')) == (v, 'TSW-1060-LB', 'default'),
+                      'value %d: a restart forgets LEDMAP, the default map again' % v)
         finally:
             m.close()
 

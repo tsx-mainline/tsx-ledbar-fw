@@ -76,16 +76,19 @@ bool tlc_set_pwm(int color, int out, uint8_t duty);
 int tlc_get_out_mode(int color, int out);
 void tlc_reset_pulse(void);
 
-/* ledmap.c: the board variant pins and the LED map */
-void ledmap_init(void);			/* read the variant pins, take the map of the value */
-unsigned ledmap_variant(void);		/* the value of the pins, 0..7 */
-bool ledmap_known(void);		/* the value has a map */
+/* ledmap.c: the LED maps and the board variant pins */
+enum ledmap_source { LEDMAP_DEFAULT, LEDMAP_PANEL, LEDMAP_CONSOLE };
+void ledmap_init(void);			/* read the variant pins, take the default map */
+unsigned ledmap_variant(void);		/* the value of the pins, 0..7: information only */
 const char *ledmap_name(void);		/* the map in use */
-bool ledmap_chosen(void);		/* LEDMAP selected the map, not the pins */
+const char *ledmap_source(void);	/* "default", "panel" or "console" */
 const uint8_t *ledmap_outputs(void);	/* the map in use: output of LED index 0..15 */
-void ledmap_auto(void);			/* LEDMAP AUTO: the map of the pins */
-bool ledmap_select(const char *what);	/* LEDMAP N|NAME: false when there is no such map */
-void ledmap_each(void (*fn)(int, const char *));	/* each map: value (-1: none), name */
+void ledmap_default(void);		/* the default map (TSW-1060-LB), source "default" */
+bool ledmap_select(const char *name, enum ledmap_source src);	/* false: no map with this name */
+void ledmap_each(void (*fn)(const char *));	/* the name of each map */
+/* the console command LEDMAP [NAME [PANEL] | DEFAULT] */
+enum ledmap_cmd { LEDMAP_SHOW, LEDMAP_DONE, LEDMAP_NO_MAP, LEDMAP_USAGE };
+enum ledmap_cmd ledmap_command(int argc, char *const *argv);
 
 /* leds.c: the LED engine */
 struct led_state {

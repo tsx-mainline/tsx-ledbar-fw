@@ -177,8 +177,8 @@ static void cmd_help(void)
 	console_write(
 		"VER                       firmware name and version\r\n"
 		"CAPS                      capabilities of this firmware\r\n"
-		"STATUS                    joins, duties, effect, uptime, board variant\r\n"
-		"LEDMAP [N|NAME|AUTO]      board variant and LED map: show, or use another map until the next start\r\n"
+		"STATUS                    joins, duties, effect, uptime, LED map\r\n"
+		"LEDMAP [NAME [PANEL]|DEFAULT]  LED map: show, or use another map until the next start\r\n"
 		"ERRLOG | CLEARERR         error log\r\n"
 		"REBOOT                    restart the application\r\n"
 		"IMGUPD                    restart into the bootloader (USB update mode)\r\n"
@@ -200,42 +200,48 @@ static void cmd_help(void)
 		"FX FREEZE ON|OFF | STEP MS  stop the effect clock, move it forward\r\n");
 }
 
-/* the board variant line of STATUS and LEDMAP */
+/* the LED map line of STATUS and LEDMAP: the variant pins, the map, its source */
 static void ledmap_line(void)
 {
-	console_printf("variant %u %s map %s %s\r\n", ledmap_variant(),
-		       ledmap_known() ? "known" : "unknown", ledmap_name(),
-		       ledmap_chosen() ? "console" : "auto");
+	console_printf("variant %u map %s %s\r\n", ledmap_variant(), ledmap_name(), ledmap_source());
 }
 
-static void print_map(int v, const char *name)
+static void print_map(const char *name)
 {
-	if (v < 0)
-		console_printf("map - %s\r\n", name);
-	else
-		console_printf("map %d %s\r\n", v, name);
+	console_printf(" %s", name);
+}
+
+static void ledmap_list(void)
+{
+	console_write("maps");
+	ledmap_each(print_map);
+	console_write("\r\n");
 }
 
 /*
- * LEDMAP: show the variant line and the maps. LEDMAP N uses the map of
- * variant value N, LEDMAP NAME the map with that name ("outputs": LED
- * index n is output n), LEDMAP AUTO the map of the variant pins. The
- * choice holds until the next start.
+ * LEDMAP: show the map line and the list of maps. LEDMAP NAME uses the
+ * map NAME until the next start ("outputs": LED index n is output n).
+ * tsx-ledbard adds the word PANEL. LEDMAP DEFAULT uses the default map
+ * again. ledmap.c parses the arguments.
  */
 static void cmd_ledmap(int argc, char **argv)
 {
-	if (argc > 1) {
-		if (eq(argv[1], "AUTO")) {
-			ledmap_auto();
-		} else if (!ledmap_select(argv[1])) {
-			console_printf("no LED map %s\r\n", argv[1]);
-			ledmap_each(print_map);
-			return;
-		}
+	switch (ledmap_command(argc, argv)) {
+	case LEDMAP_SHOW:
+		ledmap_line();
+		ledmap_list();
+		break;
+	case LEDMAP_DONE:
+		ledmap_line();
+		break;
+	case LEDMAP_NO_MAP:
+		console_printf("no LED map %s\r\n", argv[1]);
+		ledmap_list();
+		break;
+	default:
+		console_write("usage: LEDMAP [NAME [PANEL] | DEFAULT]\r\n");
+		break;
 	}
-	ledmap_line();
-	if (argc < 2)
-		ledmap_each(print_map);
 }
 
 static void cmd_status(void)

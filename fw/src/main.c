@@ -4,11 +4,10 @@
  * panels (STM32F205RC, three TLC59116 LED drivers).
  *
  * Start order: guard (watchdog and failed start count), clocks, board
- * variant pins (the LED map), LED chips (with retries), console, Cresnet,
- * USB. The main loop polls USB, runs
- * the console and Cresnet handlers, ticks the LED engine, runs the USB
- * rule of the guard and kicks the watchdog. guard.c tells which starts
- * count as failed.
+ * variant pins and the default LED map, LED chips (with retries), console,
+ * Cresnet, USB. The main loop polls USB, runs the console and Cresnet
+ * handlers, ticks the LED engine, runs the USB rule of the guard and kicks
+ * the watchdog. guard.c tells which starts count as failed.
  */
 #include "tsx.h"
 
