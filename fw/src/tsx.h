@@ -8,8 +8,8 @@
 
 #define TSX_VERSION_MAJOR	0
 #define TSX_VERSION_MINOR	1
-#define TSX_VERSION_BUILD	4
-#define TSX_VERSION_STR		"0.1.4"
+#define TSX_VERSION_BUILD	5
+#define TSX_VERSION_STR		"0.1.5"
 /* USB string 4 and the VER command: the host tools look for "TSX-LEDBAR" */
 #define TSX_FW_NAME		"TSX-LEDBAR [v" TSX_VERSION_STR "]"
 #define TSX_PRODUCT_CODE	0xE5
