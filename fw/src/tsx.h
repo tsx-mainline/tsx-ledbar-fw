@@ -92,6 +92,10 @@ void leds_base_level(int led, uint8_t rgb[3]);	/* pattern or steady host level *
 void leds_pattern_set(int first, int last, const uint8_t rgb[3]);
 void leds_pattern_clear(void);
 void leds_resync(void);			/* after TLCRESET: write all registers again */
+uint32_t leds_grp_changes(int color);	/* GRPPWM changes written by the engine */
+void leds_freeze(bool on);		/* FX FREEZE ON|OFF */
+bool leds_frozen(void);
+void leds_step(uint32_t ms);		/* FX STEP MS */
 /* effects */
 void leds_fx_off(void);
 void leds_fx_fade(const uint8_t rgb[3], uint32_t ms);
