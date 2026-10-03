@@ -41,7 +41,7 @@ class FakeBootloader:
     as the stock bootloader does, unless mute. It keeps every packet it
     gets."""
 
-    def __init__(self, log2=15, abort_at=None, mute=False):
+    def __init__(self, log2=15, abort_at=None, mute=False, refuse=0, refuse_at=None):
         self.answers = [ready(log2)]
         self.log2 = log2
         self.got = []
@@ -49,8 +49,17 @@ class FakeBootloader:
         self.ends = 0
         self.abort_at = abort_at
         self.mute = mute
+        self.refuse = refuse          # the next prepare packets that time out
+        self.refuse_at = refuse_at    # the packet number (from 1) that times out
+        self.tries = 0
 
     def write(self, data):
+        self.tries += 1
+        if bytes(data) == flash.PKT_PREPARE and self.refuse > 0:
+            self.refuse -= 1
+            raise OSError(errno.ETIMEDOUT, 'Connection timed out')
+        if self.tries == self.refuse_at:
+            raise OSError(errno.ETIMEDOUT, 'Connection timed out')
         self.got.append(bytes(data))
         if bytes(data) == flash.PKT_PREPARE and not self.mute:
             self.answers.append(ready(self.log2))
@@ -71,6 +80,24 @@ class FakeBootloader:
 def quiet(fn, *args):
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         return fn(*args)
+
+
+def run_exit(fn, *args):
+    """run fn, which must stop with SystemExit: (exit code, stdout and stderr)"""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        try:
+            fn(*args)
+        except SystemExit as e:
+            return e.code, out.getvalue()
+    return None, out.getvalue()
+
+
+FAST = {'READY_ASK_S': 0.05, 'PREPARE_PAUSE_S': 0.05}
+
+
+def fast():
+    return mock.patch.multiple(flash, **FAST)
 
 
 def write_upg(d, records, name='t.upg'):
@@ -120,11 +147,16 @@ class Packets(unittest.TestCase):
                 flash.read_records(long, upg)
 
 
+def records_at(addrs):
+    """the tag record and one 16-byte data record at each address: [(addr, body)]"""
+    tag = bytes.fromhex(upg.make_record(upg.TAG_ADDR, b'DM\xe5')[2:])[1:]
+    return [(upg.TAG_ADDR, tag)] + [
+        (a, bytes.fromhex(upg.make_record(a, bytes(16))[2:])[1:]) for a in addrs]
+
+
 class Upload(unittest.TestCase):
     def records(self, addrs):
-        tag = bytes.fromhex(upg.make_record(upg.TAG_ADDR, b'DM\xe5')[2:])[1:]
-        return [(upg.TAG_ADDR, tag)] + [
-            (a, bytes.fromhex(upg.make_record(a, bytes(16))[2:])[1:]) for a in addrs]
+        return records_at(addrs)
 
     def test_sequence(self):
         bar = FakeBootloader()
@@ -204,6 +236,119 @@ class Upload(unittest.TestCase):
         self.assertEqual(bar.got[2], flash.PKT_END_BLOCK)
         self.assertEqual(bar.got[-1], flash.PKT_END_UPDATE)
         self.assertEqual(len(bar.got), 1 + 2 + 8 + 1)
+
+
+class WriteTimeout(unittest.TestCase):
+    """A bootloader that does not take a bulk OUT packet: the write times
+    out (ETIMEDOUT). The flasher tries the prepare packet again and stops
+    with the steps to recover, not with a traceback."""
+
+    def records(self, n=8):
+        return records_at([BASE + 16 * i for i in range(n)])
+
+    def test_timeout_is_timeouterror(self):
+        self.assertIsInstance(OSError(errno.ETIMEDOUT, 'Connection timed out'), TimeoutError)
+
+    def test_prepare_refused_every_time(self):
+        bar = FakeBootloader(refuse=99)
+        bar.answers = []
+        with fast():
+            code, out = run_exit(flash.wait_ready, bar, 3)
+        self.assertEqual(code, 1)
+        self.assertEqual(bar.tries, flash.PREPARE_TRIES, 'one prepare packet for each try')
+        self.assertEqual(bar.got, [])
+        self.assertNotIn('Traceback', out)
+        self.assertIn('timed out %d times' % flash.PREPARE_TRIES, out)
+        self.assertIn('erased nothing', out)
+        self.assertIn('unplug the LED bar and plug it in again', out)
+        self.assertIn('run the flash again', out)
+        for n in range(1, flash.PREPARE_TRIES + 1):
+            self.assertIn('try %d of %d' % (n, flash.PREPARE_TRIES), out)
+
+    def test_prepare_refused_then_taken(self):
+        bar = FakeBootloader(refuse=flash.PREPARE_TRIES - 1)
+        bar.answers = []
+        recs = self.records()
+        with fast():
+            quiet(flash.upload, bar, recs)
+        self.assertEqual(bar.tries, flash.PREPARE_TRIES + 2 + 8 + 1)
+        self.assertEqual(bar.got[0], flash.PKT_PREPARE)
+        self.assertEqual(bar.got[1], flash.srec_packet(recs[0][1]))
+        self.assertEqual(bar.got[-1], flash.PKT_END_UPDATE)
+        self.assertEqual(len(bar.got), 1 + 2 + 8 + 1)
+
+    def test_pause_between_tries(self):
+        bar = FakeBootloader(refuse=99)
+        bar.answers = []
+        times = []
+        real = bar.write
+
+        def write(data):
+            times.append(flash.time.monotonic())
+            return real(data)
+        bar.write = write
+        with mock.patch.multiple(flash, READY_ASK_S=0.05, PREPARE_PAUSE_S=0.3):
+            run_exit(flash.wait_ready, bar, 3)
+        self.assertEqual(len(times), flash.PREPARE_TRIES)
+        self.assertTrue(all(b - a >= 0.29 for a, b in zip(times, times[1:])), times)
+
+    def test_ready_packet_without_prepare(self):
+        # a bootloader that refuses packets, but sends its ready packet: no prepare packet at all
+        bar = FakeBootloader(refuse=99)
+        with fast():
+            self.assertEqual(quiet(flash.wait_ready, bar, 3), 32768)
+        self.assertEqual(bar.tries, 0)
+
+    def test_record_timeout(self):
+        bar = FakeBootloader(refuse_at=5)
+        with fast():
+            code, out = run_exit(flash.upload, bar, self.records())
+        self.assertEqual(code, 1)
+        self.assertNotIn('Traceback', out)
+        self.assertIn('did not take record 3', out)
+        self.assertIn('The load is not complete', out)
+        self.assertIn('run the flash again', out)
+        self.assertNotIn(flash.PKT_END_UPDATE, bar.got)
+
+    def test_end_of_block_timeout(self):
+        bar = FakeBootloader(refuse_at=2)
+        with fast():
+            code, out = run_exit(flash.upload, bar, self.records())
+        self.assertEqual(code, 1)
+        self.assertIn('did not take the end-of-block packet', out)
+
+    def test_flash_timeout_starts_the_service(self):
+        """cmd_flash with a bar in bootloader mode that refuses the prepare
+        packet: a clear stop, and the service starts again"""
+        bar = FakeBootloader(refuse=99)
+        bar.answers = []
+        bar.sysname, bar.devnode, bar.pid, bar.is_app = '1-7', '/dev/bus/usb/001/006', '001a', False
+        bar.open = lambda iface=0: bar
+        bar.close = lambda: None
+        bar.string = lambda idx: 'CSIGN-BOOTLOADER [v001.0000.345, #FFFFFFFF]'
+        services = []
+
+        def make_service(keep):
+            services.append(FakeService(keep))
+            return services[-1]
+        with tempfile.TemporaryDirectory() as d:
+            path = write_upg(d, [(BASE, bytes(16))])
+            fake_upg = mock.MagicMock()
+            fake_upg.UpgError = upg.UpgError
+            fake_upg.read_upg.return_value = ([0xE5], [])
+            fake_upg.image_from_records.return_value = (BASE, b'')
+            fake_upg.check_image.return_value = [('crc', True, 'ok')]
+            fake_upg.header_fields.return_value = {'major': 0, 'minor': 1, 'build': 5}
+            fake_upg.parse_record = upg.parse_record
+            with fast(), mock.patch.object(flash.Bar, 'find', staticmethod(lambda: bar)), \
+                    mock.patch.object(flash, 'Service', make_service), \
+                    mock.patch.object(flash, 'load_upg_module', lambda: fake_upg):
+                code, out = run_exit(flash.cmd_flash, argparse.Namespace(upg=path, keep_service=False))
+        self.assertEqual(code, 1)
+        self.assertNotIn('Traceback', out)
+        self.assertIn('unplug the LED bar and plug it in again', out)
+        self.assertEqual(services[0].starts, 1)
+        self.assertFalse(services[0].stopped)
 
 
 class FakeAppBar:
