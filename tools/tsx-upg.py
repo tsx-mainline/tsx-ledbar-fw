@@ -28,6 +28,8 @@ import struct
 import sys
 
 TAG_ADDR = 0xBAD0ADD0
+FLASH_BASE = 0x08000000
+FLASH_END = 0x08040000      # STM32F205RC: 256 KB
 APP_BASE = 0x08020000
 APP_END = 0x08040000
 HEADER_OFF = 0x184
@@ -85,6 +87,9 @@ def read_upg(path):
     if not lines:
         raise UpgError('empty file')
     recs = [parse_record(l) for l in lines]
+    for n, (t, addr, data) in enumerate(recs, 1):
+        if t != 3:
+            raise UpgError('line %d is an S%d record, the bootloader takes only S3 records' % (n, t))
     t, addr, data = recs[0]
     if addr != TAG_ADDR or data[:2] != b'DM':
         raise UpgError('first record is not the application tag')
@@ -93,9 +98,20 @@ def read_upg(path):
 
 
 def image_from_records(recs):
-    """Return (base, bytes) of the flash content. Gaps are 0xFF."""
+    """Return (base, bytes) of the flash content. Gaps are 0xFF. Every
+    record must be in the flash, and no two records may overlap. These
+    checks come before the image is made, so a bad address cannot make a
+    large image."""
     if not recs:
         raise UpgError('no data records')
+    end = None
+    for a, d in sorted(recs):
+        if a < FLASH_BASE or a + len(d) > FLASH_END:
+            raise UpgError('record at 0x%08X is outside the flash (0x%08X..0x%08X)'
+                           % (a, FLASH_BASE, FLASH_END - 1))
+        if end is not None and a < end:
+            raise UpgError('record at 0x%08X overlaps the record before it' % a)
+        end = a + len(d)
     lo = min(a for a, d in recs)
     hi = max(a + len(d) for a, d in recs)
     img = bytearray(b'\xff' * (hi - lo))
@@ -121,6 +137,9 @@ def check_image(img, base, codes=None):
     out.append(('base', base == APP_BASE, '0x%08X' % base))
     out.append(('range', base >= APP_BASE and base + len(img) <= APP_END,
                 '0x%08X..0x%08X (%d bytes)' % (base, base + len(img) - 1, len(img))))
+    if len(img) < 8:
+        out.append(('vectors', False, 'image of %d bytes, no stack pointer and reset vector' % len(img)))
+        return out
     sp, pc = struct.unpack('<2I', img[:8])
     out.append(('stack pointer', 0x20000000 < sp <= 0x20018000, '0x%08X' % sp))
     out.append(('reset vector', base <= pc < base + len(img) and pc & 1, '0x%08X' % pc))

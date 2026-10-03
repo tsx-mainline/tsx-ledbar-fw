@@ -53,6 +53,8 @@ SUB_ABORT = 0x06
 PKT_PREPARE = bytes([DEST, 0x02, TYPE_DOWNLOAD, SUB_PREPARE])
 PKT_END_BLOCK = bytes([DEST, 0x02, TYPE_DOWNLOAD, SUB_END_BLOCK])
 PKT_END_UPDATE = bytes([DEST, 0x02, TYPE_DOWNLOAD, SUB_END_UPDATE])
+# one record goes in one USB packet of 64 bytes: DEST, length, TYPE_SREC, body
+MAX_BODY = 64 - 3
 
 
 def log(msg):
@@ -281,12 +283,24 @@ def send_io_packet(bar, pkt):
     """Send one Cresnet packet on interface 1: through the kernel driver's
     raw attribute when it is bound, otherwise with usbdevfs."""
     if os.path.exists(LED_RAW):
-        with open(LED_RAW, 'wb') as f:
-            f.write(pkt)
+        try:
+            with open(LED_RAW, 'wb') as f:
+                f.write(pkt)
+        except OSError as e:
+            die('cannot write %s: %s' % (LED_RAW, e))
         return 'driver raw attribute'
-    bar.open(1)
+    try:
+        bar.open(1)
+    except OSError as e:
+        bar.close()
+        if e.errno == errno.EBUSY:
+            die('cannot claim USB interface 1 of the bar: a kernel driver holds it, but %s does not exist. '
+                'The driver is another version. Unbind it or update it, then try again' % LED_RAW)
+        die('cannot open USB interface 1 of the bar: %s' % e)
     try:
         bar.write(pkt)
+    except OSError as e:
+        die('cannot send on USB interface 1 of the bar: %s' % e)
     finally:
         bar.close()
     return 'usbdevfs interface 1'
@@ -370,6 +384,9 @@ def upload(bar, records):
     block_start = None
     n = len(records) - 1
     for i, (addr, body) in enumerate(records[1:], 1):
+        # A new block starts at a record above the block start plus the
+        # block size. A record at exactly that address stays in the block.
+        # The vendor host (DmFwUpload in libCNETTransport.so) does the same.
         if block_start is None:
             block_start = addr
         elif addr > block_start + size:
@@ -390,16 +407,20 @@ def upload(bar, records):
 
 def read_records(path, upg):
     """The records of the .upg as (addr, body bytes). The body is the
-    record after its count byte: address, data and checksum."""
+    record after its count byte: address, data and checksum. A body must
+    fit one USB packet with the 3 bytes in front of it."""
     with open(path, 'rb') as f:
-        text = f.read().decode('ascii')
+        text = f.read().decode('ascii', 'replace')
     out = []
     for line in text.replace('\r', '\n').split('\n'):
         if not line:
             continue
         t, addr, data = upg.parse_record(line)
-        raw = bytes.fromhex(line[2:])
-        out.append((addr, raw[1:]))
+        body = bytes.fromhex(line[2:])[1:]
+        if len(body) > MAX_BODY:
+            raise upg.UpgError('the record at 0x%08X has %d bytes after the count, one USB packet takes %d'
+                               % (addr, len(body), MAX_BODY))
+        out.append((addr, body))
     return out
 
 
@@ -470,10 +491,17 @@ def cmd_enter(args):
         log('the bar is already in bootloader mode')
         return
     service = Service(args.keep_service)
-    bar = enter_bootloader(bar, service)
-    if bar is None:
-        die('the bootloader did not enumerate')
+    try:
+        bar = enter_bootloader(bar, service)
+        if bar is None:
+            die('the bootloader did not enumerate')
+    except BaseException:
+        service.start()
+        raise
     log('bootloader on %s as 14be:%s' % (bar.sysname, bar.pid))
+    if service.stopped:
+        log('the tsx-ledbar service stays stopped while the bar is in bootloader mode. '
+            'After a load with "tsx-ledbar-flash flash FILE.upg", start it: rc-service tsx-ledbar start')
 
 
 def cmd_port_reset(args):
@@ -489,16 +517,19 @@ def cmd_port_reset(args):
 
 def cmd_flash(args):
     upg = load_upg_module()
-    codes, recs = upg.read_upg(args.upg)
-    base, img = upg.image_from_records(recs)
-    checks = upg.check_image(img, base, codes)
+    try:
+        codes, recs = upg.read_upg(args.upg)
+        base, img = upg.image_from_records(recs)
+        checks = upg.check_image(img, base, codes)
+        records = read_records(args.upg, upg)
+    except (upg.UpgError, OSError) as e:
+        die('%s: %s. Nothing sent' % (args.upg, e))
     bad = [c for c in checks if not c[1]]
     if bad:
         for name, ok, text in bad:
             print('  %-14s BAD  %s' % (name, text))
         die('%s failed its checks, nothing sent' % args.upg)
     hdr = upg.header_fields(img, base)
-    records = read_records(args.upg, upg)
     log('image %s: version %d.%d.%d, %d bytes at 0x%08X, %d records, checks ok' % (
         args.upg, hdr['major'], hdr['minor'], hdr['build'], len(img), base, len(records)))
 
