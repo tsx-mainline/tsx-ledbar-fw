@@ -442,11 +442,20 @@ void usb_poll(void)
 	pump_io();
 }
 
+/* the time the bar stays on the bus after the flush, see usb_flush */
+#define FLUSH_LINGER_MS	20
+
 /*
  * Before a planned reset: poll USB for at most ms, until the console text
  * has left the bar (the ring is empty and the IN endpoint is idle). Only
  * usb_poll moves text to the endpoint, so a reset right after a console
  * answer would lose the answer.
+ *
+ * Then stay on the bus for FLUSH_LINGER_MS. The last packet has left the
+ * bar, but the host driver can still be on its way to complete the
+ * transfer. The reset removes the pull-up at once. A host driver that sees
+ * the disconnect first drops the data: on the panel the read of the
+ * REBOOT answer ended with ECONNRESET.
  */
 void usb_flush(uint32_t ms)
 {
@@ -459,7 +468,12 @@ void usb_flush(uint32_t ms)
 			return;
 		if (console_tail == console_head &&
 		    !(OTG_FS_DIEPCTL(EP_CONSOLE_IN & 0x7F) & OTG_DIEPCTL0_EPENA))
-			return;
+			break;
+	}
+	start = millis();
+	while (configured && millis() - start < FLUSH_LINGER_MS) {
+		usb_poll();
+		guard_kick();
 	}
 }
 
