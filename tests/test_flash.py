@@ -37,17 +37,23 @@ def ready(log2):
 class FakeBootloader:
     """A bar in bootloader mode. It sends the ready packet first and an
     accept packet after each end of block, or an abort after end of block
-    number abort_at. It keeps every packet it gets."""
+    number abort_at. It answers the prepare packet with a ready packet,
+    as the stock bootloader does, unless mute. It keeps every packet it
+    gets."""
 
-    def __init__(self, log2=15, abort_at=None):
+    def __init__(self, log2=15, abort_at=None, mute=False):
         self.answers = [ready(log2)]
+        self.log2 = log2
         self.got = []
         self.gone = False
         self.ends = 0
         self.abort_at = abort_at
+        self.mute = mute
 
     def write(self, data):
         self.got.append(bytes(data))
+        if bytes(data) == flash.PKT_PREPARE and not self.mute:
+            self.answers.append(ready(self.log2))
         if bytes(data) == flash.PKT_END_BLOCK:
             self.ends += 1
             self.answers.append(bytes([0x02, 0x02, 0x04, 0x06]) if self.ends == self.abort_at else ready(15))
@@ -164,6 +170,40 @@ class Upload(unittest.TestCase):
         bar.answers = []
         with self.assertRaises(SystemExit):
             quiet(flash.wait_ready, bar, 0.3)
+
+    def test_ready_packet_no_prepare(self):
+        # the ready packet of the bootloader start: no prepare packet
+        bar = FakeBootloader()
+        with mock.patch.object(flash, 'READY_ASK_S', 0.05):
+            self.assertEqual(quiet(flash.wait_ready, bar, 3), 32768)
+        self.assertEqual(bar.got, [])
+
+    def test_lost_ready_packet(self):
+        # a bar that waits in bootloader mode: its start ready packet is lost
+        bar = FakeBootloader()
+        bar.answers = []
+        with mock.patch.object(flash, 'READY_ASK_S', 0.05):
+            self.assertEqual(quiet(flash.wait_ready, bar, 3), 32768)
+        self.assertEqual(bar.got, [flash.PKT_PREPARE])
+
+    def test_mute_bootloader_one_prepare(self):
+        bar = FakeBootloader(mute=True)
+        bar.answers = []
+        with mock.patch.object(flash, 'READY_ASK_S', 0.05), self.assertRaises(SystemExit):
+            quiet(flash.wait_ready, bar, 0.5)
+        self.assertEqual(bar.got, [flash.PKT_PREPARE])
+
+    def test_upload_after_lost_ready_packet(self):
+        bar = FakeBootloader()
+        bar.answers = []
+        recs = self.records([BASE + 16 * i for i in range(8)])
+        with mock.patch.object(flash, 'READY_ASK_S', 0.05):
+            quiet(flash.upload, bar, recs)
+        self.assertEqual(bar.got[0], flash.PKT_PREPARE)
+        self.assertEqual(bar.got[1], flash.srec_packet(recs[0][1]))
+        self.assertEqual(bar.got[2], flash.PKT_END_BLOCK)
+        self.assertEqual(bar.got[-1], flash.PKT_END_UPDATE)
+        self.assertEqual(len(bar.got), 1 + 2 + 8 + 1)
 
 
 class FakeAppBar:

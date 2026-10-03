@@ -55,6 +55,8 @@ PKT_END_BLOCK = bytes([DEST, 0x02, TYPE_DOWNLOAD, SUB_END_BLOCK])
 PKT_END_UPDATE = bytes([DEST, 0x02, TYPE_DOWNLOAD, SUB_END_UPDATE])
 # one record goes in one USB packet of 64 bytes: DEST, length, TYPE_SREC, body
 MAX_BODY = 64 - 3
+# seconds to wait for the ready packet before the prepare packet goes to the bootloader
+READY_ASK_S = 2.0
 
 
 def log(msg):
@@ -330,15 +332,29 @@ def pkt_text(p):
 
 def wait_ready(bar, timeout_s=10):
     """Read until the ready packet (type 04, sub-type 01, block size).
-    Returns the block size. Reads on until the bar goes quiet."""
+    Returns the block size. Reads on until the bar goes quiet.
+
+    The bootloader sends the ready packet one time, when it starts. If no
+    host reads it in time, the packet is lost, and a bar that waits in
+    bootloader mode sends nothing. The bootloader answers the prepare
+    packet with a new ready packet. It also sets its update state back to
+    the start and erases nothing. Thus, when no ready packet comes within
+    READY_ASK_S, send the prepare packet one time."""
     time.sleep(0.1)
-    end = time.monotonic() + timeout_s
+    start = time.monotonic()
+    end = start + timeout_s
     size = None
+    asked = False
     while time.monotonic() < end:
         p = bar.read(1000)
         if not p:
             if size is not None:
                 return size
+            if not asked and time.monotonic() - start >= READY_ASK_S:
+                asked = True
+                log('no ready packet within %.0f s, sending the prepare packet %s to the bootloader'
+                    % (READY_ASK_S, PKT_PREPARE.hex(' ')))
+                bar.write(PKT_PREPARE)
             continue
         log('bootloader: %s' % pkt_text(p))
         if len(p) >= 4 and p[2] == TYPE_DOWNLOAD and p[3] == SUB_ABORT:
