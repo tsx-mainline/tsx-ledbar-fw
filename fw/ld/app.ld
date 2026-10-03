@@ -3,7 +3,7 @@
  * Linker script of the tsx-ledbar firmware (STM32F205RC, 256 KB flash,
  * 96 KB RAM). The application region starts at 0x08020000 (flash sector 5
  * and up). The first 256 bytes of RAM stay out of .data and .bss: the
- * bootloader mailbox is at 0x200000F4 and the guard counter follows it.
+ * bootloader mailbox is at 0x200000F4 and the two guard words follow it.
  *
  * TSX_ROM_ORIGIN can be set with --defsym for the QEMU build, which runs
  * without the bootloader and starts at 0x08000000.
@@ -20,7 +20,7 @@ MEMORY
 /* bootloader mailbox and guard words, outside every section */
 tsx_mailbox = 0x200000F4;
 tsx_guard_magic = 0x200000F8;
-tsx_guard_count = 0x200000FC;
+tsx_guard_state = 0x200000FC;
 
 EXTERN (vector_table)
 ENTRY(reset_handler)

@@ -5,14 +5,30 @@
 #   tsx-ledbar-fw-install            load the packaged image
 #   tsx-ledbar-fw-install FILE.upg   load another image
 #   tsx-ledbar-fw-install --check    exit 0 when the bar runs the packaged version
+#   tsx-ledbar-fw-install --recover-image
+#                                    print the image that --recover loads, exit 3 when
+#                                    there is none
+#   tsx-ledbar-fw-install --recover  load that image into a bar in bootloader mode
+#
+# --recover is for the tsx-ledbar service (tsx-ledbard). It loads the image that
+# the panel is set up for. The marker means TSX-LEDBAR: the packaged image.
+# Without the marker the panel keeps the stock firmware, and the newest stock
+# image in /data/tsx/vendor/ is loaded, as tsx-ledbar-fw-uninstall does. Only
+# when the panel has no stock image, the packaged image is the last choice.
+# --recover keeps the tsx-ledbar service running, because the service calls it.
+# It does not write or remove the marker, and it does not touch a bar that
+# runs its application.
 #
 # The install writes a marker in /data/tsx (ledbar-fw.installed). While the
 # marker exists, a package upgrade loads the new image again. The marker goes
 # away with tsx-ledbar-fw-uninstall, which loads the stock image back.
 IMAGE=${TSX_LEDBAR_FW_IMAGE:-/usr/share/tsx-ledbar-fw/tsx-ledbar.upg}
 MARKER=${TSX_LEDBAR_FW_MARKER:-/data/tsx/ledbar-fw.installed}
+STOCK_DIR=${TSX_LEDBAR_STOCK_DIR:-/data/tsx/vendor}
 FLASH=${TSX_LEDBAR_FLASH:-tsx-ledbar-flash}
 LIB=${TSX_LEDBAR_FW_LIB:-/usr/local/lib/tsx-ledbar-fw}
+LEDS=${TSX_LEDBAR_LEDS:-/sys/class/leds/tsx:rgb:bar}
+USB=${TSX_LEDBAR_USB:-/sys/bus/usb/devices}
 
 die() { echo "tsx-ledbar-fw-install: $*" >&2; exit 1; }
 
@@ -32,24 +48,64 @@ restart_bar_users() {
 }
 
 bar_firmware() {
-	cat /sys/class/leds/tsx:rgb:bar/firmware 2>/dev/null
+	cat "$LEDS"/firmware 2>/dev/null
 }
 
+# true when the bar is on USB in bootloader mode (14be:001a)
+bar_in_bootloader() {
+	for d in "$USB"/*; do
+		[ "$(cat "$d"/idVendor 2>/dev/null)" = 14be ] &&
+			[ "$(cat "$d"/idProduct 2>/dev/null)" = 001a ] && return 0
+	done
+	return 1
+}
+
+# Print the image for a bar in bootloader mode, or fail when there is none.
+# The same stock image lookup as tsx-ledbar-fw-uninstall.
+recover_image() {
+	stock=$(ls "$STOCK_DIR"/statussign_*.upg 2>/dev/null | sort -V | tail -1)
+	if [ -e "$MARKER" ] && [ -r "$IMAGE" ]; then
+		echo "$IMAGE"
+	elif [ -n "$stock" ] && [ -r "$stock" ]; then
+		echo "$stock"
+	elif [ -r "$IMAGE" ]; then
+		echo "$IMAGE"
+	else
+		return 1
+	fi
+}
+
+# the version in the image header. Fails when the image fails its checks.
 image_version() {
-	python3 "$LIB"/tsx-upg.py info "$1" | sed -n 's/^ *version *ok *//p'
+	info=$(python3 "$LIB"/tsx-upg.py info "$1") || return 1
+	echo "$info" | sed -n 's/^ *version *ok *//p'
 }
 
 case $1 in
 --check)
-	want=$(image_version "$IMAGE") || die "cannot read $IMAGE"
+	want=$(image_version "$IMAGE") && [ -n "$want" ] ||
+		die "cannot read the version of $IMAGE"
 	have=$(bar_firmware)
 	case $have in
 	*"TSX-LEDBAR [v$want]"*) echo "bar runs tsx-ledbar $want"; exit 0;;
-	"") die "no LED bar found";;
+	"")
+		bar_in_bootloader &&
+			die "the LED bar is in bootloader mode. Run tsx-ledbar-fw-install to load the firmware"
+		die "no LED bar found";;
 	*) echo "bar runs \"$have\", package has $want"; exit 1;;
 	esac;;
+--recover-image) recover_image || exit 3; exit 0;;
+--recover)
+	[ "$(id -u)" = 0 ] || die "run as root"
+	bar_in_bootloader || { echo "the LED bar is not in bootloader mode, nothing to recover"; exit 0; }
+	IMAGE=$(recover_image) || die "no image to load: no packaged image and no stock image in $STOCK_DIR"
+	echo "loading $IMAGE into the LED bar"
+	"$FLASH" --keep-service flash "$IMAGE" || die "flash failed, the bar keeps its bootloader"
+	restart_bar_users
+	echo "LED bar recovered from bootloader mode"
+	exit 0;;
 "") ;;
--*) die "usage: tsx-ledbar-fw-install [FILE.upg | --check]";;
+-*) die "usage: tsx-ledbar-fw-install [FILE.upg | --check | --recover-image | --recover]";;
 *) IMAGE=$1;;
 esac
 

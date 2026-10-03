@@ -3,7 +3,9 @@
 """Tests of tools/tsx-upg.py. With TSX_STOCK_UPG set to the stock
 statussign .upg file (never in the repo), the stock image is checked and
 repacked byte for byte."""
+import contextlib
 import importlib.util
+import io
 import os
 import struct
 import sys
@@ -93,6 +95,83 @@ class Pack(unittest.TestCase):
             rc = upg.main(['pack', b, os.path.join(d, 'x.upg')])
             self.assertEqual(rc, 2)
             self.assertFalse(os.path.exists(os.path.join(d, 'x.upg')))
+
+
+def s1_record(addr, data):
+    body = bytes([len(data) + 3]) + addr.to_bytes(2, 'big') + bytes(data)
+    return 'S1' + (body + bytes([0xFF - (sum(body) & 0xFF)])).hex().upper()
+
+
+def write_lines(d, lines, name='h.upg'):
+    path = os.path.join(d, name)
+    with open(path, 'w', newline='') as f:
+        for l in lines:
+            f.write(l + '\r\n')
+    return path
+
+
+TAG = upg.make_record(upg.TAG_ADDR, b'DM\xe5')
+
+
+class Hostile(unittest.TestCase):
+    """Bad or hostile files end in UpgError or a failed check, never in a
+    traceback or a large allocation."""
+
+    def test_short_line(self):
+        with self.assertRaises(upg.UpgError):
+            upg.parse_record('S3')
+
+    def test_non_hex(self):
+        with self.assertRaises(upg.UpgError):
+            upg.parse_record('S30508020000ZZ')
+
+    def test_odd_hex(self):
+        with self.assertRaises(upg.UpgError):
+            upg.parse_record(upg.make_record(upg.APP_BASE, b'\x01')[:-1])
+
+    def test_count_mismatch(self):
+        line = upg.make_record(upg.APP_BASE, b'\x01\x02')
+        with self.assertRaises(upg.UpgError):
+            upg.parse_record(line[:2] + '09' + line[4:])
+
+    def test_s1_record_refused(self):
+        self.assertEqual(upg.parse_record(s1_record(0x1000, b'\x01'))[0], 1)
+        with tempfile.TemporaryDirectory() as d:
+            path = write_lines(d, [TAG, s1_record(0x1000, b'\x01\x02')])
+            with self.assertRaises(upg.UpgError):
+                upg.read_upg(path)
+
+    def test_record_outside_flash(self):
+        good = (upg.APP_BASE, bytes(16))
+        for a in (0, 0x07FFFFF0, 0x08040000, 0xFFFFFFF0, upg.FLASH_END - 8):
+            with self.assertRaises(upg.UpgError, msg='0x%08X' % a):
+                upg.image_from_records([good, (a, bytes(16))])
+
+    def test_overlapping_records(self):
+        with self.assertRaises(upg.UpgError):
+            upg.image_from_records([(upg.APP_BASE, bytes(16)), (upg.APP_BASE + 8, bytes(16))])
+        base, img = upg.image_from_records([(upg.APP_BASE + 16, b'\x02' * 16), (upg.APP_BASE, b'\x01' * 16)])
+        self.assertEqual((base, img), (upg.APP_BASE, b'\x01' * 16 + b'\x02' * 16))
+
+    def test_short_image(self):
+        checks = upg.check_image(b'\x00\x00\x00\x00', upg.APP_BASE, [upg.PRODUCT])
+        self.assertIn(('vectors', False), [(n, ok) for n, ok, _ in checks])
+
+    def test_cli_hostile_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            far = write_lines(d, [TAG, upg.make_record(upg.APP_BASE, bytes(16)),
+                                  upg.make_record(0xFFFFFFF0, bytes(16))], 'far.upg')
+            short = write_lines(d, [TAG, upg.make_record(upg.APP_BASE, bytes(4))], 'short.upg')
+            junk = os.path.join(d, 'junk.upg')
+            with open(junk, 'wb') as f:
+                f.write(b'\xff\xfe binary')
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(upg.main(['info', far]), 2)
+                self.assertEqual(upg.main(['verify', far]), 2)
+                self.assertEqual(upg.main(['verify', short]), 1)
+                self.assertEqual(upg.main(['info', junk]), 2)
+            self.assertIn('outside the flash', err.getvalue())
 
 
 @unittest.skipUnless(os.environ.get('TSX_STOCK_UPG'), 'TSX_STOCK_UPG not set')

@@ -8,8 +8,8 @@
 
 #define TSX_VERSION_MAJOR	0
 #define TSX_VERSION_MINOR	1
-#define TSX_VERSION_BUILD	3
-#define TSX_VERSION_STR		"0.1.3"
+#define TSX_VERSION_BUILD	4
+#define TSX_VERSION_STR		"0.1.4"
 /* USB string 4 and the VER command: the host tools look for "TSX-LEDBAR" */
 #define TSX_FW_NAME		"TSX-LEDBAR [v" TSX_VERSION_STR "]"
 #define TSX_PRODUCT_CODE	0xE5
@@ -31,20 +31,27 @@ uint32_t millis(void);
 void delay_ms(uint32_t ms);
 void system_reset(void);
 
-/* guard.c */
-void guard_boot(void);
+/* guard.c: the start guard */
+void guard_boot(void);			/* first at start: watchdog, failed start count */
+void guard_report(void);		/* error log entries about the last start */
+void guard_poll(void);			/* main loop: the USB rule */
+void guard_usb_host(void);		/* SOF packets after a bus reset: a host runs */
 void guard_usb_configured(void);
 void guard_kick(void);
+void guard_reboot(void);		/* REBOOT: a planned reset */
 void guard_request_bootloader(void);	/* IMGUPD: mailbox "UPG", reset */
 uint32_t guard_reset_flags(void);
-uint32_t guard_start_count(void);
+uint32_t guard_start_count(void);	/* this start since power-on */
+uint32_t guard_fails(void);		/* failed starts in a row */
 
 /* errlog.c */
 #define ERR_TLC_INIT		119	/* LED driver chip did not answer */
 #define ERR_I2C			120
-#define ERR_WATCHDOG		121
-#define ERR_GUARD		122
-#define ERR_USB			123
+#define ERR_WATCHDOG		121	/* the last start ended in a reset that was not planned */
+#define ERR_GUARD		122	/* cause: failed starts in a row */
+#define ERR_USB			123	/* cause: the IN endpoint that was stuck */
+#define ERR_FAULT		124	/* the last start ended in a hard fault */
+#define ERR_NOCONFIG		125	/* the last start: a host ran, no USB configuration */
 void errlog_add(uint16_t subsystem, uint16_t cause);
 int errlog_count(void);
 void errlog_clear(void);
@@ -92,6 +99,10 @@ void leds_base_level(int led, uint8_t rgb[3]);	/* pattern or steady host level *
 void leds_pattern_set(int first, int last, const uint8_t rgb[3]);
 void leds_pattern_clear(void);
 void leds_resync(void);			/* after TLCRESET: write all registers again */
+uint32_t leds_grp_changes(int color);	/* GRPPWM changes written by the engine */
+void leds_freeze(bool on);		/* FX FREEZE ON|OFF */
+bool leds_frozen(void);
+void leds_step(uint32_t ms);		/* FX STEP MS */
 /* effects */
 void leds_fx_off(void);
 void leds_fx_fade(const uint8_t rgb[3], uint32_t ms);
@@ -113,6 +124,7 @@ unsigned leds_get_cap(void);
 /* usb_dev.c */
 void usb_init(void);
 void usb_poll(void);
+void usb_flush(uint32_t ms);		/* before a reset: send the console text (at most ms), then wait 20 ms */
 bool usb_configured(void);
 void usb_debug_state(uint32_t v[7]);	/* DIEPCTL1, DIEPINT1, DIEPTSIZ1, GINTSTS, DAINT, console head, tail */
 /* console (interface 0) text out, Cresnet (interface 1) packets out */

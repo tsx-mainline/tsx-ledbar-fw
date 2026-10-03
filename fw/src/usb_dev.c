@@ -91,6 +91,17 @@ bool usb_configured(void)
 static usbd_device *dev;
 static uint8_t control_buf[128];
 
+/* IN endpoint state, see "IN endpoint arming" below */
+struct in_ep {
+	uint8_t last[EP_SIZE];
+	uint8_t last_len;
+	uint32_t stuck_since;
+	bool stuck_seen;
+	bool resend;		/* send the last packet again when the endpoint is idle */
+};
+
+static struct in_ep in_eps[3];	/* index = endpoint number */
+
 static const struct usb_device_descriptor dev_desc = {
 	.bLength = USB_DT_DEVICE_SIZE,
 	.bDescriptorType = USB_DT_DEVICE,
@@ -208,9 +219,18 @@ static void io_out_cb(usbd_device *d, uint8_t ep)
 		cresnet_rx(buf, (size_t)n);
 }
 
+/*
+ * SET_CONFIGURATION. The value 0 puts the device back in the address
+ * state: the library has reset the endpoints, and the firmware must stop
+ * the IN data. It is not a configuration for the guard either.
+ */
 static void set_config_cb(usbd_device *d, uint16_t wValue)
 {
-	(void)wValue;
+	if (wValue == 0) {
+		configured = false;
+		return;
+	}
+	memset(in_eps, 0, sizeof(in_eps));	/* new endpoints: no packet to send again */
 	usbd_ep_setup(d, EP_CONSOLE_OUT, USB_ENDPOINT_ATTR_BULK, EP_SIZE, console_out_cb);
 	usbd_ep_setup(d, EP_CONSOLE_IN, USB_ENDPOINT_ATTR_BULK, EP_SIZE, NULL);
 	usbd_ep_setup(d, EP_IO_OUT, USB_ENDPOINT_ATTR_BULK, EP_SIZE, io_out_cb);
@@ -219,9 +239,26 @@ static void set_config_cb(usbd_device *d, uint16_t wValue)
 	guard_usb_configured();
 }
 
+/*
+ * The guard must know when a host runs on the bus. A bus reset alone does
+ * not tell it: a host that powers up or goes down can give a short reset.
+ * A running host sends a SOF packet every millisecond, and the core keeps
+ * the frame number of the last SOF in DSTS. So a new frame number after a
+ * bus reset tells that a host runs.
+ */
+static bool sof_wait;		/* a bus reset came, no SOF after it yet */
+static uint32_t sof_frame;
+
+static uint32_t frame_number(void)
+{
+	return (OTG_FS_DSTS >> 8) & 0x3FFF;	/* FNSOF */
+}
+
 static void reset_cb(void)
 {
 	configured = false;
+	sof_wait = true;
+	sof_frame = frame_number();
 }
 
 /*
@@ -268,19 +305,13 @@ void usb_init(void)
  *    unbounded waits on the core, which never end while the host does
  *    not poll. The check happens here instead, with bounded waits.
  * 3. Should an endpoint still get stuck (EPENA and NAKSTS for more than
- *    IN_STUCK_MS), it is disabled, its FIFO flushed, and the last packet
- *    is sent again. A copy of the last packet is kept for that.
+ *    IN_STUCK_MS), it is disabled and its FIFO flushed. A copy of the
+ *    last packet is kept, and it goes out again when the endpoint is idle
+ *    (EPENA clear, NAKSTS set), by rule 1. When the disable does not end
+ *    within its wait, EPENA stays set, and the endpoint is stuck again
+ *    after IN_STUCK_MS. The library write is never called with EPENA set.
  */
 #define IN_STUCK_MS	2000
-
-struct in_ep {
-	uint8_t last[EP_SIZE];
-	uint8_t last_len;
-	uint32_t stuck_since;
-	bool stuck_seen;
-};
-
-static struct in_ep in_eps[3];	/* index = endpoint number */
 
 static bool wait_bit(volatile uint32_t *reg, uint32_t mask, bool set, uint32_t ms)
 {
@@ -318,7 +349,15 @@ static bool ep_in_ready(uint8_t addr)
 
 	if (!(ctl & OTG_DIEPCTL0_EPENA)) {
 		e->stuck_seen = false;
-		return (ctl & OTG_DIEPCTL0_NAKSTS) != 0;
+		if (!(ctl & OTG_DIEPCTL0_NAKSTS))
+			return false;
+		if (e->resend) {
+			/* the packet that the recovery took off the endpoint */
+			e->resend = false;
+			usbd_ep_write_packet(dev, addr, e->last, e->last_len);
+			return false;
+		}
+		return true;
 	}
 	if (!(ctl & OTG_DIEPCTL0_NAKSTS)) {
 		e->stuck_seen = false;	/* packet in flight */
@@ -333,8 +372,7 @@ static bool ep_in_ready(uint8_t addr)
 		return false;
 	ep_in_recover(ep);
 	e->stuck_seen = false;
-	if (e->last_len && (OTG_FS_DIEPCTL(ep) & OTG_DIEPCTL0_NAKSTS))
-		usbd_ep_write_packet(dev, addr, e->last, e->last_len);
+	e->resend = e->last_len != 0;
 	return false;
 }
 
@@ -394,13 +432,57 @@ void usb_debug_state(uint32_t v[7])
 void usb_poll(void)
 {
 	usbd_poll(dev);
+	if (sof_wait && frame_number() != sof_frame) {
+		sof_wait = false;
+		guard_usb_host();
+	}
 	if (!configured)
 		return;
 	pump_console();
 	pump_io();
 }
 
+/* the time the bar stays on the bus after the flush, see usb_flush */
+#define FLUSH_LINGER_MS	20
+
+/*
+ * Before a planned reset: poll USB for at most ms, until the console text
+ * has left the bar (the ring is empty and the IN endpoint is idle). Only
+ * usb_poll moves text to the endpoint, so a reset right after a console
+ * answer would lose the answer.
+ *
+ * Then stay on the bus for FLUSH_LINGER_MS. The last packet has left the
+ * bar, but the host driver can still be on its way to complete the
+ * transfer. The reset removes the pull-up at once. A host driver that sees
+ * the disconnect first drops the data: on the panel the read of the
+ * REBOOT answer ended with ECONNRESET.
+ */
+void usb_flush(uint32_t ms)
+{
+	uint32_t start = millis();
+
+	while (millis() - start < ms) {
+		usb_poll();
+		guard_kick();
+		if (!configured)
+			return;
+		if (console_tail == console_head &&
+		    !(OTG_FS_DIEPCTL(EP_CONSOLE_IN & 0x7F) & OTG_DIEPCTL0_EPENA))
+			break;
+	}
+	start = millis();
+	while (configured && millis() - start < FLUSH_LINGER_MS) {
+		usb_poll();
+		guard_kick();
+	}
+}
+
 #else /* TSX_QEMU: no USB model, the console runs on USART1 */
+
+void usb_flush(uint32_t ms)
+{
+	(void)ms;	/* console_write sends to the UART at once */
+}
 
 void usb_init(void)
 {

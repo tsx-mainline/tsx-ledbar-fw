@@ -15,24 +15,43 @@
 
 #define LINE_MAX 96
 #define ARGS_MAX 10
+#define RX_RING	512
 
 static char line[LINE_MAX];
 static unsigned line_len;
-static bool line_ready;
+static uint8_t rx_ring[RX_RING];
+static unsigned rx_head, rx_tail;
 
 static const char *const color_names[NCOLORS] = { "RED", "GREEN", "BLUE" };
 
+/*
+ * Received bytes go into a ring. One USB packet can hold more than one
+ * line, so console_poll takes the lines out of the ring one by one. When
+ * the ring is full, the rest of the data is lost.
+ */
 void console_rx(const uint8_t *data, size_t n)
 {
 	for (size_t i = 0; i < n; i++) {
-		char c = (char)data[i];
+		unsigned next = (rx_head + 1) % RX_RING;
 
-		if (line_ready)
-			break;		/* one line at a time */
+		if (next == rx_tail)
+			break;
+		rx_ring[rx_head] = data[i];
+		rx_head = next;
+	}
+}
+
+/* move bytes from the ring into the line: true when a line is complete */
+static bool line_from_ring(void)
+{
+	while (rx_tail != rx_head) {
+		char c = (char)rx_ring[rx_tail];
+
+		rx_tail = (rx_tail + 1) % RX_RING;
 		if (c == '\r' || c == '\n') {
 			if (line_len) {
 				line[line_len] = 0;
-				line_ready = true;
+				return true;
 			}
 			continue;
 		}
@@ -44,6 +63,7 @@ void console_rx(const uint8_t *data, size_t n)
 		if (line_len < LINE_MAX - 1 && c >= ' ')
 			line[line_len++] = c;
 	}
+	return false;
 }
 
 static bool eq(const char *a, const char *b)
@@ -160,10 +180,10 @@ static void cmd_help(void)
 		"ERRLOG | CLEARERR         error log\r\n"
 		"REBOOT                    restart the application\r\n"
 		"IMGUPD                    restart into the bootloader (USB update mode)\r\n"
-		"TLCOUTMODE COLOR NUM MODE output mode of a TLC59116 output (NUM 0-15 or ALL)\r\n"
-		"TLCGROUPMODE COLOR MODE   0 = group dimming, 1 = group blinking\r\n"
-		"TLCBRIGHTNESS COLOR NUM|GROUP PERCENT\r\n"
+		"TLCOUTMODE COLOR NUM|ALL  output mode of a TLC59116 output\r\n"
+		"TLCOUTMODE COLOR NUM MODE, TLCGROUPMODE, TLCBRIGHTNESS   refused: use LED SET, FX\r\n"
 		"TLCRESET                  reset and init the LED driver chips\r\n"
+		"TLCREGS COLOR             read the registers of a TLC59116\r\n"
 		"SELFTEST LED ON|OFF [COLOR|ALL] [PERCENT]\r\n"
 		"LED COLOR LEVEL|CONTROL|BLINK VALUE   the host joins, by hand\r\n"
 		"LED SET LEDS R G B        LEDS: R1..R8, L1..L8, 0..15, A-B, R, L or ALL\r\n"
@@ -174,7 +194,8 @@ static void cmd_help(void)
 		"FX RAINBOW MS [LEVEL] | SMOOTH MS | CAP PERCENT\r\n"
 		"FX CHASE R G B MS | FILL R G B PERCENT\r\n"
 		"FX SPECTRUM MS [LEVEL] [RING|ROWS]   RING (default) turns around the bar\r\n"
-		"FX SPLIT R G B R G B      right side color, left side color\r\n");
+		"FX SPLIT R G B R G B      right side color, left side color\r\n"
+		"FX FREEZE ON|OFF | STEP MS  stop the effect clock, move it forward\r\n");
 }
 
 static void cmd_status(void)
@@ -196,62 +217,80 @@ static void cmd_status(void)
 		       pwm[0], grp[0], pwm[1], grp[1], pwm[2], grp[2]);
 	console_printf("leds %s%s (LED GET shows each LED)\r\n", s->pattern_on ? "pattern" : "host",
 		       s->limited ? " limit" : "");
-	console_printf("chips %s %s %s uptime %lu ms start %lu reset flags 0x%08lX errors %d\r\n",
+	console_printf("chips %s %s %s uptime %lu ms start %lu fails %lu reset flags 0x%08lX errors %d\r\n",
 		       tlc_ready(RED) ? "ok" : "BAD", tlc_ready(GREEN) ? "ok" : "BAD",
 		       tlc_ready(BLUE) ? "ok" : "BAD", (unsigned long)millis(),
-		       (unsigned long)guard_start_count(), (unsigned long)guard_reset_flags(),
-		       errlog_count());
+		       (unsigned long)guard_start_count(), (unsigned long)guard_fails(),
+		       (unsigned long)guard_reset_flags(), errlog_count());
 }
 
+/*
+ * The stock TLC commands. The LED engine owns the chip registers: it
+ * applies the per-LED limit and the bar cap, and it keeps a copy of the
+ * registers it wrote. A raw write would skip both limits (LEDOUT mode 1 is
+ * fully on, blink mode runs on PWMx alone, a raw PWMx or GRPPWM skips the
+ * limits), and the copy would no longer match the chip. So only the read
+ * form runs: TLCOUTMODE COLOR NUM|ALL shows the output mode, as the stock
+ * firmware does (tsx-ledbard reads it). The write forms answer "refused".
+ * LED SET and FX set the light.
+ */
 static void cmd_tlc(int argc, char **argv)
 {
-	long v, n;
-	int c = color_arg(argv[1]);
+	long n;
+	int out, c = color_arg(argv[1]);
 
 	if (c < 0) {
 		console_write("usage: see HELP\r\n");
+		return;
+	}
+	if (!eq(argv[0], "TLCOUTMODE") || argc > 3) {
+		console_printf("%s refused: the LED engine sets the chip registers, with the power limits. "
+			       "Use LED SET or FX\r\n", argv[0]);
 		return;
 	}
 	if (!tlc_ready(c)) {
 		console_write("LED driver not initialized!\r\n");
 		return;
 	}
-	if (eq(argv[0], "TLCOUTMODE")) {
-		int out = eq(argv[2], "ALL") ? -1 : -2;
-
-		if (out == -2 && (!num_arg(argv[2], 0, 15, &n) || (out = (int)n) < 0)) {
-			console_write("usage: TLCOUTMODE COLOR NUM|ALL [MODE]\r\n");
-			return;
-		}
-		if (argc > 3) {
-			if (!num_arg(argv[3], 0, 3, &v) || !tlc_set_out_mode(c, out, (int)v)) {
-				console_write("TLCOUTMODE failed\r\n");
-				return;
-			}
-		}
-		console_printf("%s %d output mode is:%d\r\n", color_names[c], out,
-			       tlc_get_out_mode(c, out < 0 ? 0 : out));
-	} else if (eq(argv[0], "TLCGROUPMODE")) {
-		if (!num_arg(argv[2], 0, 1, &v) || !tlc_set_group_blink(c, v == 1, 0)) {
-			console_write("usage: TLCGROUPMODE COLOR 0|1\r\n");
-			return;
-		}
-		console_printf("%s group mode is:%ld\r\n", color_names[c], v);
-	} else if (eq(argv[0], "TLCBRIGHTNESS")) {
-		bool ok;
-
-		if (!num_arg(argv[3], 0, 100, &v)) {
-			console_write("usage: TLCBRIGHTNESS COLOR NUM|GROUP PERCENT\r\n");
-			return;
-		}
-		if (eq(argv[2], "GROUP"))
-			ok = tlc_set_group_pwm(c, (uint8_t)(v * 255 / 100));
-		else if (num_arg(argv[2], 0, 15, &n))
-			ok = tlc_set_pwm(c, (int)n, (uint8_t)(v * 255 / 100));
-		else
-			ok = false;
-		console_printf("%s brightness %s\r\n", color_names[c], ok ? "set" : "failed");
+	if (eq(argv[2], "ALL")) {
+		out = -1;
+	} else if (num_arg(argv[2], 0, 15, &n)) {
+		out = (int)n;
+	} else {
+		console_write("usage: TLCOUTMODE COLOR NUM|ALL\r\n");
+		return;
 	}
+	console_printf("%s %d output mode is:%d\r\n", color_names[c], out,
+		       tlc_get_out_mode(c, out < 0 ? 0 : out));
+}
+
+/*
+ * TLCREGS COLOR: read registers 0x00..0x17 from the chip (not from the
+ * copy in RAM), and the number of GRPPWM changes the engine wrote.
+ */
+static void cmd_tlcregs(const char *arg)
+{
+	int c = arg ? color_arg(arg) : -1;
+	uint8_t r[0x18];
+
+	if (c < 0) {
+		console_write("usage: TLCREGS COLOR\r\n");
+		return;
+	}
+	if (!tlc_ready(c)) {
+		console_write("LED driver not initialized!\r\n");
+		return;
+	}
+	if (!tlc_read(c, 0, r, sizeof(r))) {
+		console_write("TLCREGS failed\r\n");
+		return;
+	}
+	console_printf("%s mode %02X %02X grp %u freq %u ledout %02X %02X %02X %02X grp changes %lu\r\n",
+		       color_names[c], r[0], r[1], r[0x12], r[0x13], r[0x14], r[0x15], r[0x16], r[0x17],
+		       (unsigned long)leds_grp_changes(c));
+	console_printf("%s pwm %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u\r\n", color_names[c],
+		       r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9],
+		       r[10], r[11], r[12], r[13], r[14], r[15], r[16], r[17]);
 }
 
 static void cmd_selftest(int argc, char **argv)
@@ -418,6 +457,15 @@ static void cmd_fx(int argc, char **argv)
 	} else if (eq(argv[1], "SPLIT") && argc >= 8 && rgb_args(argv + 2, rgb) &&
 		   rgb_args(argv + 5, rgb2)) {
 		leds_fx_split(rgb, rgb2);
+	} else if (eq(argv[1], "FREEZE")) {
+		if (argc > 2)
+			leds_freeze(!eq(argv[2], "OFF"));
+		console_printf("freeze %s\r\n", leds_frozen() ? "on" : "off");
+		return;
+	} else if (eq(argv[1], "STEP") && argc >= 3 && num_arg(argv[2], 1, 600000, &a)) {
+		leds_step((uint32_t)a);
+		console_printf("step %ld ms\r\n", a);
+		return;
 	} else if (eq(argv[1], "SMOOTH") && argc >= 3 && num_arg(argv[2], 0, 60000, &a)) {
 		leds_set_smooth((uint32_t)a);
 	} else if (eq(argv[1], "CAP") && argc >= 3 && num_arg(argv[2], 10, 150, &a)) {
@@ -428,6 +476,37 @@ static void cmd_fx(int argc, char **argv)
 	}
 	console_printf("fx %s\r\n", leds_fx_name());
 }
+
+#ifdef TSX_QEMU
+/*
+ * QEMU build only: events that the QEMU machine cannot make. For the
+ * tests of the start guard: HOST, a host runs on the bus (bus reset and
+ * SOF packets) with no configuration. CONFIG: USB configured. FAULT: a
+ * hard fault. RESET: a reset that the firmware did not plan, as the
+ * watchdog gives (QEMU has no watchdog model). For the console: RX gives
+ * three lines to console_rx in one call, as one USB packet does.
+ */
+static void cmd_test(const char *what)
+{
+	static const char three[] = "VER\r\nUPTIME\r\nCAPS\r\n";
+
+	if (eq(what, "RX")) {
+		console_rx((const uint8_t *)three, sizeof(three) - 1);
+	} else if (eq(what, "HOST")) {
+		guard_usb_host();
+	} else if (eq(what, "CONFIG")) {
+		guard_usb_configured();
+	} else if (eq(what, "FAULT")) {
+		__builtin_trap();
+	} else if (eq(what, "RESET")) {
+		system_reset();
+	} else {
+		console_write("usage: TEST HOST|CONFIG|FAULT|RESET|RX\r\n");
+		return;
+	}
+	console_printf("test %s\r\n", what);
+}
+#endif
 
 static void run_line(void)
 {
@@ -469,19 +548,21 @@ static void run_line(void)
 		console_write("error log cleared\r\n");
 	} else if (eq(argv[0], "REBOOT")) {
 		console_write("Rebooting\r\n");
-		delay_ms(50);
-		system_reset();
+		usb_flush(100);
+		guard_reboot();
 	} else if (eq(argv[0], "IMGUPD")) {
 		if (argc > 1 && eq(argv[1], "?")) {
 			console_write(" IMGUPD - reboot into bootloader\r\n");
 			return;
 		}
 		console_write("Rebooting into the bootloader\r\n");
-		delay_ms(50);
+		usb_flush(100);
 		guard_request_bootloader();
 	} else if (eq(argv[0], "TLCRESET")) {
 		console_printf("TLC reset %s\r\n", tlc_init() ? "ok" : "FAILED");
 		leds_resync();
+	} else if (eq(argv[0], "TLCREGS")) {
+		cmd_tlcregs(argc > 1 ? argv[1] : NULL);
 	} else if (eq(argv[0], "TLCOUTMODE") || eq(argv[0], "TLCGROUPMODE") ||
 		   eq(argv[0], "TLCBRIGHTNESS")) {
 		if (argc < 3)
@@ -496,12 +577,19 @@ static void run_line(void)
 		cmd_fx(argc, argv);
 #ifdef TSX_QEMU
 	} else if (eq(argv[0], "TRACE")) {
-		extern bool leds_trace, leds_trace_pix;
+		extern bool leds_trace, leds_trace_pix, leds_trace_regs;
 
-		/* ON: "led MS R G B" per tick, PIX: also "pix MS" and 48 duties */
-		leds_trace_pix = argc > 1 && eq(argv[1], "PIX");
+		/*
+		 * ON: "led MS R G B" per tick, PIX: also "pix MS" and 48 duties,
+		 * REGS: also "reg MS" and PWM0..15 and GRPPWM of red, green, blue
+		 */
+		leds_trace_regs = argc > 1 && eq(argv[1], "REGS");
+		leds_trace_pix = leds_trace_regs || (argc > 1 && eq(argv[1], "PIX"));
 		leds_trace = leds_trace_pix || (argc > 1 && eq(argv[1], "ON"));
-		console_printf("trace %s\r\n", leds_trace_pix ? "pix" : leds_trace ? "on" : "off");
+		console_printf("trace %s\r\n", leds_trace_regs ? "regs" : leds_trace_pix ? "pix" :
+			       leds_trace ? "on" : "off");
+	} else if (eq(argv[0], "TEST")) {
+		cmd_test(argc > 1 ? argv[1] : NULL);
 #endif
 	} else {
 		console_printf("unknown command: %s (HELP for a list)\r\n", argv[0]);
@@ -511,14 +599,14 @@ static void run_line(void)
 void console_init(void)
 {
 	line_len = 0;
-	line_ready = false;
+	rx_head = rx_tail = 0;
 }
 
+/* run each complete line in the ring */
 void console_poll(void)
 {
-	if (!line_ready)
-		return;
-	run_line();
-	line_len = 0;
-	line_ready = false;
+	while (line_from_ring()) {
+		run_line();
+		line_len = 0;
+	}
 }
