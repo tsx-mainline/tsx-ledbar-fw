@@ -23,6 +23,7 @@ FLAGS = ['-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Wshadow', '-Werror',
 TESTS = {
     'test_guard.c': ['guard.c', 'errlog.c'],
     'test_i2c.c': ['i2c_tlc.c', 'errlog.c'],
+    'test_cresnet.c': ['cresnet.c'],
 }
 
 
@@ -43,6 +44,9 @@ class FirmwareHost(unittest.TestCase):
 
     def test_i2c(self):
         self.build_run('test_i2c.c')
+
+    def test_cresnet(self):
+        self.build_run('test_cresnet.c')
 
 
 if __name__ == '__main__':
