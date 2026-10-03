@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * LED engine. It runs every 10 ms, keeps a level for each of the 16 LEDs
+ * LED engine. It runs every 10 ms, keeps a duty for each of the 16 LEDs
  * and each color, and writes the chip registers only when they change.
  *
  * LED index (tsx.h): 0..7 are R1..R8, the right side from top to bottom.
@@ -27,11 +27,20 @@
  * BLINK, BREATHE, RAINBOW, CHASE and SPECTRUM repeat until they stop.
  *
  * Color math: a level 0..100 is a lightness. It maps to a duty 0..65535
- * of full brightness with the CIE 1976 lightness curve, so a linear fade
- * in level looks linear, and the curve is linear near zero, so a fade
- * does not dwell at the bottom. Ramps and effects work in level units
- * with 8 fraction bits, and the duty is interpolated between the table
- * entries.
+ * of full brightness with the CIE 1976 lightness curve, and the curve is
+ * linear near zero, so a fade does not dwell at the bottom. The duty is
+ * interpolated between the table entries (8 fraction bits of level).
+ * An effect that dims a color dims it in light: all three duties get the
+ * same factor, so the duty ratios (the hue) stay the same. The factor
+ * follows the CIE curve of the lightness of the effect, so the fade looks
+ * even. BREATHE, the top row of FILL, and the level of RAINBOW and
+ * SPECTRUM work this way. A ramp (FADE, FILL, SPLIT, FX OFF, the smooth
+ * time of the host color) goes on a straight line between the duties of
+ * its two ends, timed so the lightness of the sum of the duties changes
+ * linearly. Dimming each color on its own would change the hue: 84 38 100
+ * would turn green and pink near zero. When a fade from or to black would
+ * round one color to 0 while another is still lit, the LED goes dark as a
+ * whole.
  *
  * Power limits: one value "cap" (FX CAP, default 110) sets two limits.
  * 1. The per-LED limit: the sum of the red, green and blue duty of one LED
@@ -45,35 +54,41 @@
  * The engine applies the per-LED limit first. Then the sum of the 48
  * duties is never above the bar cap, so the bar cap is a second guard.
  * With one color on the whole bar, both limits give the duties of 0.1.2.
- * CHASE and FILL apply the per-LED limit to their color before they share
- * it between rows, so a dot or a part of a row keeps its part of the light.
+ * CHASE, FILL, BREATHE, RAINBOW, SPECTRUM and ramps apply the per-LED
+ * limit to their full color before they share or dim it. So a dot or a
+ * part of a row keeps its part of the light, and a BREATHE does not sit
+ * at the limit for a part of each period.
  *
  * Dimming: brightness on the chip is PWMx x GRPPWM (see i2c_tlc.c), with
  * one PWMx per output and one GRPPWM per chip. PWMx runs at 97 kHz,
- * GRPPWM is the duty of a free-running 190 Hz window. A GRPPWM write that
- * lands inside the window can give that chip a wrong brightness for up to
- * one window (5 ms). In 0.1.3 a mixed-color CHASE wrote a new GRPPWM on
- * every tick and showed short one-color flashes. So GRPPWM changes only
- * when the light of the chip changes by a large factor:
- * 1. need = ceil(tmax / 255) is the smallest GRPPWM that still lets the
- *    brightest output reach its duty with PWMx <= 255.
- * 2. need > GRPPWM: raise GRPPWM to 1.5 x need (at most 255).
- * 3. GRPPWM >= 4 x need (PWMx of the brightest output 64 or less): lower
- *    GRPPWM by 1/8 (at least 1), but not below 1.5 x need. On the bar a
- *    lower GRPPWM in one large step (2.5 to 3 times) showed as a short
- *    flash, although PWMx x GRPPWM stayed continuous. Small steps, as in
- *    BREATHE of 0.1.3, do not show.
- * 4. Else keep GRPPWM, so only PWMx changes.
- * PWMx = t / GRPPWM goes in the same transfer, so the light stays
- * continuous at a change. The brightest output keeps PWMx near 64 or
- * more, steps of about 1.6 % or finer. Light that changes inside a range
- * of 2 (CHASE: the dot shares its light between two rows) or keeps its
- * peak (SPECTRUM, FILL, SPLIT) runs on a constant GRPPWM. On the way down
- * a BREATHE or a fade lowers GRPPWM in small steps through the low range.
- * On the way up it raises GRPPWM about 7 times. A dark chip gets PWMx 0,
- * and after one tick GRPPWM 1, so a dim start (the bottom of BREATHE)
- * gets steps of 1/65025. One transfer writes the registers from the first
- * changed one to the last changed one.
+ * GRPPWM is the duty of a free-running 190 Hz window. A lower GRPPWM that
+ * the chip gets while its window is open lets the window run to the end
+ * of the period, so a lit output flashes too bright for up to 5 ms. On
+ * the bar this showed as one-color flashes in CHASE (0.1.3 wrote a new
+ * GRPPWM on most ticks) and in the low part of a BREATHE down ramp. A
+ * higher GRPPWM is safe. So for each chip and tick, with
+ * need = ceil(tmax / 255), the smallest GRPPWM that lets the brightest
+ * output reach its target with PWMx <= 255:
+ * 1. need > GRPPWM: raise GRPPWM to 1.5 x tmax / 255 (at most 255).
+ * 2. GRPPWM >= 4 x need (the brightest PWMx is 64 or less):
+ *    a. the chip was dark at the last write, or its light has not fallen
+ *       for STEADY_TICKS ticks: write the new GRPPWM with PWMx 0 (dark for
+ *       this tick), light the chip on the next tick;
+ *    b. else (a falling light) keep GRPPWM. An output below half a step
+ *       rounds to 0.
+ * 3. Else keep GRPPWM, so only PWMx changes.
+ * A chip that went dark by rounding on a light that does not rise stays dark
+ * until the light rises again or stops falling for STEADY_TICKS ticks
+ * (held[]), and lowers GRPPWM in the dark. So
+ * a BREATHE goes dark a little before the bottom and starts again from
+ * GRPPWM 1 with steps of 1/65025. Chips that come out of the dark light
+ * on the same tick. When an output rounds to 0 and the other colors of
+ * that LED are at their last steps (PWMx 2 or less), the LED goes dark as
+ * a whole, so the three colors go dark together. Light that changes
+ * inside a range of 2 (CHASE: the dot shares its light between two rows)
+ * or keeps its peak (SPECTRUM, FILL, SPLIT) runs on a constant GRPPWM.
+ * One transfer writes the registers from the first changed one to the
+ * last changed one.
  */
 #include <string.h>
 #include "tsx.h"
@@ -106,8 +121,12 @@ static struct led_state st;
 static uint32_t smooth_ms;
 static unsigned cap_percent = 110;
 
-static int32_t cur[NLEDS][NCOLORS];	/* current level, FP */
-static int32_t ramp_from[NLEDS][NCOLORS], ramp_to[NLEDS][NCOLORS];
+static uint32_t cur[NLEDS][NCOLORS];	/* current duty 0..65535, before the limits */
+static uint32_t ramp_a[NLEDS][NCOLORS], ramp_b[NLEDS][NCOLORS];	/* the ends, after the per-LED limit */
+static uint32_t ramp_raw[NLEDS][NCOLORS];	/* the target as given, shown at the end */
+static uint32_t ramp_sa[NLEDS], ramp_sb[NLEDS], ramp_smax[NLEDS];
+static int32_t ramp_la[NLEDS], ramp_lb[NLEDS];
+static uint16_t ramp_lim, ramp_extra;
 static uint32_t ramp_start, ramp_ms;
 static int32_t base_target[NLEDS][NCOLORS];	/* last base target, to detect changes */
 
@@ -118,11 +137,17 @@ static uint8_t fx_level;
 static bool fx_ring;		/* SPECTRUM: the ring, not the rows */
 static uint16_t direct_duty[NCOLORS];
 static uint32_t last_tick;
-static bool fx_limited;	/* CHASE, FILL: the per-LED limit scaled the effect color */
+/* LEDs whose color the per-LED limit scaled before the engine dimmed or shared it */
+static uint16_t lim_bits;
+static bool fx_frozen;		/* FX FREEZE: the effect clock stands still */
+static uint32_t fx_step_ms;	/* FX STEP: move the effect clock forward */
 
 /* the registers PWM0..15 and GRPPWM as the engine last wrote them */
 static uint8_t sent[NCOLORS][TLC_DIM_REGS];
 static uint32_t grp_changes[NCOLORS];	/* GRPPWM writes of the engine, for TLCREGS */
+static bool held[NCOLORS];		/* dark while the light falls */
+static uint32_t prev_tmax[NCOLORS];
+static uint8_t steady[NCOLORS];		/* ticks without a fall of tmax */
 
 /* CIE 1976: Y = L / 903.3 for L <= 8, else ((L + 16) / 116)^3, x 65535 */
 static const uint16_t cie_table[101] = {
@@ -221,10 +246,42 @@ static void hue_to_rgb(uint32_t hue, uint8_t level, int32_t out[NCOLORS])
 	out[BLUE] = (int32_t)(b * level * FP / 255);
 }
 
-static void fill_all(int32_t out[NLEDS][NCOLORS], const int32_t rgb[NCOLORS])
+static void fill_all(uint32_t out[NLEDS][NCOLORS], const uint32_t rgb[NCOLORS])
 {
 	for (int i = 0; i < NLEDS; i++)
 		memcpy(out[i], rgb, sizeof(out[i]));
+}
+
+static void levels_to_duties(int32_t lv[NLEDS][NCOLORS], uint32_t out[NLEDS][NCOLORS])
+{
+	for (int i = 0; i < NLEDS; i++) {
+		for (int c = 0; c < NCOLORS; c++)
+			out[i][c] = level_to_duty(lv[i][c]);
+	}
+}
+
+/* the light (0..65535) of a lightness that is the fraction k (0..65535) of the full range */
+static uint32_t envelope(uint32_t k)
+{
+	return level_to_duty((int32_t)((uint64_t)k * LEVEL_MAX / 65535U));
+}
+
+/*
+ * Dim a color in light: each duty times e / 65535, so the duty ratios,
+ * the hue, stay the same. WHOLE: when a lit channel would round to 0, the
+ * LED goes dark as a whole, so the three colors go dark together.
+ */
+static void scale_color(const uint32_t full[NCOLORS], uint32_t e, uint32_t out[NCOLORS], bool whole)
+{
+	bool cut = false, lit = false;
+
+	for (int c = 0; c < NCOLORS; c++) {
+		out[c] = (uint32_t)((uint64_t)full[c] * e / 65535U);
+		cut = cut || (full[c] && !out[c]);
+		lit = lit || out[c];
+	}
+	if (whole && cut && lit)
+		memset(out, 0, NCOLORS * sizeof(out[0]));
 }
 
 /*
@@ -237,7 +294,24 @@ void leds_resync(void)
 		for (int o = 0; o < 16; o++)
 			sent[c][o] = tlc_get_pwm(c, o);
 		tlc_get_dim(c, &sent[c][0], &sent[c][16]);
+		held[c] = false;
 	}
+}
+
+/* FX FREEZE: stop or run the effect clock. FX STEP: move it forward by MS */
+void leds_freeze(bool on)
+{
+	fx_frozen = on;
+}
+
+bool leds_frozen(void)
+{
+	return fx_frozen;
+}
+
+void leds_step(uint32_t ms)
+{
+	fx_step_ms += ms;
 }
 
 /* the number of GRPPWM changes the engine wrote to the chip since the start */
@@ -281,7 +355,8 @@ static void base_color(int32_t out[NLEDS][NCOLORS])
 			on = ((now / (st.blink_100ms[c] * 100U)) & 1) == 0;
 		host[c] = on ? st.level[c] * FP : 0;
 	}
-	fill_all(out, host);
+	for (int i = 0; i < NLEDS; i++)
+		memcpy(out[i], host, sizeof(out[i]));
 }
 
 /* the per-LED limit: the highest red + green + blue duty of one LED */
@@ -313,10 +388,53 @@ static bool limited_color(const uint8_t rgb[NCOLORS], uint32_t d[NCOLORS])
 	return limit_led(d);
 }
 
-static void start_ramp(int32_t to[NLEDS][NCOLORS], uint32_t ms)
+/*
+ * Ramps work in light: each LED goes on a straight line between the duties
+ * of its two ends (after the per-LED limit), so a fade of one color keeps
+ * its hue. The time on that line follows the lightness: the lightness of
+ * the sum of the three duties moves linearly from one end to the other.
+ * TO is the target as duties before the limits. EXTRA: LEDs that show the
+ * limit flag for this target (FILL).
+ */
+/*
+ * A hue at full level (the hue math of hue_to_rgb), after the per-LED
+ * limit, dimmed in light by e. Return true when the limit scaled it.
+ */
+static bool hue_color(uint32_t hue, uint32_t e, uint32_t out[NCOLORS])
 {
-	memcpy(ramp_from, cur, sizeof(cur));
-	memcpy(ramp_to, to, sizeof(ramp_to));
+	int32_t lv[NCOLORS];
+	uint32_t full[NCOLORS];
+	bool lim;
+
+	hue_to_rgb(hue, 100, lv);
+	for (int c = 0; c < NCOLORS; c++)
+		full[c] = level_to_duty(lv[c]);
+	lim = limit_led(full);
+	scale_color(full, e, out, false);
+	return lim;
+}
+
+static void start_ramp(uint32_t to[NLEDS][NCOLORS], uint32_t ms, uint16_t extra)
+{
+	ramp_lim = lim_bits | extra;
+	ramp_extra = extra;
+	for (int i = 0; i < NLEDS; i++) {
+		uint32_t *a = ramp_a[i], *b = ramp_b[i], sa, sb, smax;
+
+		memcpy(a, cur[i], sizeof(ramp_a[i]));
+		memcpy(b, to[i], sizeof(ramp_b[i]));
+		if (limit_led(a) | limit_led(b))
+			ramp_lim |= (uint16_t)(1U << i);
+		sa = a[RED] + a[GREEN] + a[BLUE];
+		sb = b[RED] + b[GREEN] + b[BLUE];
+		smax = sa > sb ? sa : sb;
+		ramp_sa[i] = sa;
+		ramp_sb[i] = sb;
+		ramp_smax[i] = smax;
+		ramp_la[i] = smax ? duty_to_level((uint32_t)((uint64_t)sa * 65535U / smax)) : 0;
+		ramp_lb[i] = smax ? duty_to_level((uint32_t)((uint64_t)sb * 65535U / smax)) : 0;
+	}
+	memcpy(ramp_raw, to, sizeof(ramp_raw));
 	ramp_start = millis();
 	ramp_ms = ms;
 }
@@ -325,44 +443,67 @@ static void run_ramp(void)
 {
 	uint32_t t = millis() - ramp_start;
 
+	if (ramp_ms == 0 || t >= ramp_ms) {
+		memcpy(cur, ramp_raw, sizeof(cur));
+		lim_bits = ramp_extra;
+		return;
+	}
+	lim_bits = ramp_lim;
 	for (int i = 0; i < NLEDS; i++) {
-		for (int c = 0; c < NCOLORS; c++) {
-			int32_t a = ramp_from[i][c], b = ramp_to[i][c];
+		uint32_t sa = ramp_sa[i], sb = ramp_sb[i], smax = ramp_smax[i];
+		int64_t w;	/* 0..65536 along the line */
+		bool cut = false, lit = false;
 
-			if (ramp_ms == 0 || t >= ramp_ms)
-				cur[i][c] = b;
-			else
-				cur[i][c] = a + (int32_t)((int64_t)(b - a) * (int32_t)t / (int32_t)ramp_ms);
+		if (smax == 0) {
+			memset(cur[i], 0, sizeof(cur[i]));
+			continue;
 		}
+		if (sa == sb) {
+			w = (int64_t)t * 65536 / ramp_ms;
+		} else {
+			int32_t l = ramp_la[i] + (int32_t)((int64_t)(ramp_lb[i] - ramp_la[i]) * (int32_t)t /
+							   (int32_t)ramp_ms);
+			int64_t x = (int64_t)level_to_duty(l) * smax / 65535;
+
+			w = (x - (int64_t)sa) * 65536 / ((int64_t)sb - (int64_t)sa);
+			w = w < 0 ? 0 : w > 65536 ? 65536 : w;
+		}
+		for (int c = 0; c < NCOLORS; c++) {
+			uint64_t a = ramp_a[i][c], b = ramp_b[i][c];
+
+			cur[i][c] = (uint32_t)((a * (uint64_t)(65536 - w) + b * (uint64_t)w) >> 16);
+			cut = cut || ((a || b) && !cur[i][c]);
+			lit = lit || cur[i][c];
+		}
+		/* a fade from or to black: the three colors go dark together */
+		if ((sa == 0 || sb == 0) && cut && lit)
+			memset(cur[i], 0, sizeof(cur[i]));
 	}
 }
 
 /*
  * GRPPWM rules, see the comment at the top. GRP_IDLE: a dark chip.
- * grp_for(need): a raised GRPPWM, 1.5 x need. GRP_LOWER: lower GRPPWM
- * only when it is this many times the need, by 1/8 per tick. GRP_LOWER must stay above
- * 2 x 1.5, so light that changes inside a range of 2 does not change
- * GRPPWM.
+ * GRP_LOWER: GRPPWM is too coarse at this many times the need.
+ * STEADY_TICKS: ticks without a fall of the light before a coarse chip
+ * goes dark for one tick to lower GRPPWM.
  */
 #define GRP_IDLE	1
 #define GRP_LOWER	4
+#define STEADY_TICKS	3
 
-static uint32_t grp_for(uint32_t need)
+
+/* a new GRPPWM for the brightest target tmax: 1.5 x tmax / 255, rounded up */
+static uint32_t grp_for(uint32_t tmax)
 {
-	uint32_t g = (3 * need + 1) / 2;
+	uint32_t g = (3 * tmax + 509) / 510;
 
 	return g > 255 ? 255 : g;
 }
 
-/*
- * Duties of one chip to its 17 registers. A duty d is the target
- * t = d x 65025 / 65535 in units of 1/65025. GRPPWM g follows the rules
- * at the top, PWMx = t / g rounded, at least 1 for a lit output.
- */
-static void chip_regs(uint32_t duty[NLEDS][NCOLORS], int c, uint8_t v[TLC_DIM_REGS])
+/* the targets of one chip by output, t = d x 65025 / 65535, at least 1 when lit */
+static uint32_t chip_targets(uint32_t duty[NLEDS][NCOLORS], int c, uint32_t t[16])
 {
-	uint32_t t[16], tmax = 0, g = sent[c][16], need, p;
-	bool dark = g == 0;
+	uint32_t tmax = 0;
 
 	for (int i = 0; i < NLEDS; i++) {
 		uint32_t d = duty[i][c], x = 0;
@@ -376,31 +517,99 @@ static void chip_regs(uint32_t duty[NLEDS][NCOLORS], int c, uint8_t v[TLC_DIM_RE
 		if (x > tmax)
 			tmax = x;
 	}
-	if (!dark) {
-		dark = true;
-		for (int o = 0; o < 16; o++)
-			dark = dark && sent[c][o] == 0;
-	}
-	memset(v, 0, 16);
-	if (tmax == 0) {
-		/* dark since the last write: GRPPWM 1, so the next light is a raise */
-		v[16] = (uint8_t)(dark ? GRP_IDLE : g);
-		return;
-	}
-	need = (tmax + 254) / 255;
-	if (need > g) {
-		g = grp_for(need);
-	} else if (g >= GRP_LOWER * need) {
-		/* at most 1/8 down in one tick: a large step down shows as a flash */
-		uint32_t lo = g - (g + 7) / 8;
+	return tmax;
+}
 
-		g = lo > grp_for(need) ? lo : grp_for(need);
+/* the 17 registers of each chip for these duties, see the comment at the top */
+static void chips_regs(uint32_t duty[NLEDS][NCOLORS], uint8_t v[NCOLORS][TLC_DIM_REGS])
+{
+	uint32_t t[NCOLORS][16], tmax[NCOLORS];
+	bool coarse[NCOLORS] = { false }, lowering[NCOLORS] = { false };
+	bool released[NCOLORS] = { false }, rise = false, still = true, any_held = false;
+	bool release, any_lowering = false;
+
+	for (int c = 0; c < NCOLORS; c++) {
+		tmax[c] = chip_targets(duty, c, t[c]);
+		steady[c] = tmax[c] < prev_tmax[c] ? 0 : steady[c] < 255 ? steady[c] + 1 : 255;
+		if (held[c]) {
+			any_held = true;
+			rise = rise || tmax[c] > prev_tmax[c];
+			still = still && steady[c] >= STEADY_TICKS;
+		}
 	}
+	/* a held chip lights again when a held light rises, or none falls any more */
+	release = any_held && (rise || still);
+	for (int c = 0; c < NCOLORS; c++) {
+		uint32_t g = sent[c][16], need = (tmax[c] + 254) / 255, p;
+		bool dark = true;
+
+		for (int o = 0; o < 16; o++)
+			dark = dark && (g == 0 || sent[c][o] == 0);
+		if (held[c] && release) {
+			held[c] = false;
+			released[c] = true;
+		}
+		memset(v[c], 0, 16);
+		if (tmax[c] == 0) {
+			/* dark since the last write: GRPPWM 1, so the next light is a raise */
+			held[c] = false;
+			v[c][16] = (uint8_t)(dark ? GRP_IDLE : g);
+			continue;
+		}
+		if (held[c]) {
+			/* the light still falls: stay dark, lower GRPPWM in the dark */
+			if (dark && g >= GRP_LOWER * need)
+				g = grp_for(tmax[c]);
+			v[c][16] = (uint8_t)g;
+			continue;
+		}
+		if (need > g) {
+			g = grp_for(tmax[c]);		/* a raise is safe */
+		} else if (g >= GRP_LOWER * need) {
+			if (dark || steady[c] >= STEADY_TICKS) {
+				/* lower GRPPWM only in a write with PWMx 0 */
+				v[c][16] = (uint8_t)grp_for(tmax[c]);
+				lowering[c] = any_lowering = true;
+				continue;
+			}
+			coarse[c] = true;	/* a falling light: keep GRPPWM */
+		}
+		for (int o = 0; o < 16; o++) {
+			p = (t[c][o] + g / 2) / g;
+			v[c][o] = (uint8_t)(t[c][o] == 0 ? 0 : p > 255 ? 255 : p == 0 && !coarse[c] ? 1 : p);
+		}
+		v[c][16] = (uint8_t)g;
+	}
+	/* chips that come out of the dark light together */
+	for (int c = 0; c < NCOLORS; c++) {
+		if (released[c] && any_lowering)
+			memset(v[c], 0, 16);
+	}
+	/*
+	 * An output of a coarse chip rounds to 0: when the other colors of
+	 * that LED are also at their last steps, the LED goes dark as a whole.
+	 */
 	for (int o = 0; o < 16; o++) {
-		p = (t[o] + g / 2) / g;
-		v[o] = (uint8_t)(t[o] == 0 ? 0 : p > 255 ? 255 : p == 0 ? 1 : p);
+		bool cut = false, small = true;
+
+		for (int c = 0; c < NCOLORS; c++) {
+			cut = cut || (coarse[c] && t[c][o] && !v[c][o]);
+			small = small && v[c][o] <= 2;
+		}
+		if (cut && small) {
+			for (int c = 0; c < NCOLORS; c++)
+				v[c][o] = 0;
+		}
 	}
-	v[16] = (uint8_t)g;
+	for (int c = 0; c < NCOLORS; c++) {
+		bool off = true;
+
+		for (int o = 0; o < 16; o++)
+			off = off && v[c][o] == 0;
+		if (tmax[c] && off && tmax[c] <= prev_tmax[c] && !lowering[c])
+			held[c] = true;
+		prev_tmax[c] = tmax[c];
+	}
 }
 
 /* write the span of registers that changed, in one transfer */
@@ -431,14 +640,13 @@ static void apply(void)
 	uint32_t duty[NLEDS][NCOLORS];
 	uint64_t sum = 0, cap = (uint64_t)NLEDS * led_limit();
 	uint16_t limited = 0;
-	uint8_t v[TLC_DIM_REGS];
+	uint8_t v[NCOLORS][TLC_DIM_REGS];
 
 	for (int i = 0; i < NLEDS; i++) {
 		for (int c = 0; c < NCOLORS; c++)
-			duty[i][c] = fx == FX_DIRECT ? direct_duty[c] : level_to_duty(cur[i][c]);
+			duty[i][c] = fx == FX_DIRECT ? direct_duty[c] : cur[i][c];
 		if (limit_led(duty[i]) ||
-		    (fx_limited && (fx == FX_CHASE || fx == FX_FILL) &&
-		     duty[i][RED] + duty[i][GREEN] + duty[i][BLUE] > 0))
+		    ((lim_bits >> i & 1) && duty[i][RED] + duty[i][GREEN] + duty[i][BLUE] > 0))
 			limited |= (uint16_t)(1U << i);
 		sum += duty[i][RED] + duty[i][GREEN] + duty[i][BLUE];
 	}
@@ -449,11 +657,11 @@ static void apply(void)
 				duty[i][c] = (uint32_t)((uint64_t)duty[i][c] * cap / sum);
 		}
 	}
+	chips_regs(duty, v);
 	for (int c = 0; c < NCOLORS; c++) {
 		uint32_t max = 0;
 
-		chip_regs(duty, c, v);
-		if (!chip_write(c, v))
+		if (!chip_write(c, v[c]))
 			continue;	/* the next tick tries again */
 		for (int i = 0; i < NLEDS; i++) {
 			st.led_duty[i][c] = (uint16_t)duty[i][c];
@@ -507,7 +715,7 @@ static void run_chase(uint32_t now)
 	uint32_t pos = (now - fx_t0) % fx_a * (NROWS * 256U) / fx_a;	/* 0..2047 */
 	uint32_t full[NCOLORS];
 
-	fx_limited = limited_color(fx_rgb, full);	/* FX CAP can change while it runs */
+	lim_bits = limited_color(fx_rgb, full) ? 0xFFFF : 0;	/* FX CAP can change while it runs */
 
 	for (int r = 0; r < NROWS; r++) {
 		int32_t d = (int32_t)pos - r * 256;
@@ -520,10 +728,8 @@ static void run_chase(uint32_t now)
 		k = d >= 256 ? 0 : 256U - (uint32_t)d;	/* 0..256 */
 		for (int c = 0; c < NCOLORS; c++) {
 			/* share the light, not the lightness, so the sum stays the same */
-			int32_t l = duty_to_level(full[c] * k / 256U);
-
-			cur[r][c] = l;
-			cur[NROWS + r][c] = l;
+			cur[r][c] = full[c] * k / 256U;
+			cur[NROWS + r][c] = cur[r][c];
 		}
 	}
 }
@@ -537,20 +743,21 @@ static void run_chase(uint32_t now)
 static void run_spectrum(uint32_t now)
 {
 	uint32_t phase = (now - fx_t0) % fx_a * 1536U / fx_a;
+	uint32_t e = level_to_duty(fx_level * FP);
+	int n = fx_ring ? NLEDS : NROWS;
 
-	if (fx_ring) {
-		for (int p = 0; p < NLEDS; p++) {
-			uint32_t hue = (p * (1536U / NLEDS) + 1536U - phase) % 1536U;
+	lim_bits = 0;
+	for (int p = 0; p < n; p++) {
+		uint32_t hue = (p * (1536U / (uint32_t)n) + 1536U - phase) % 1536U;
+		int led = fx_ring ? ring_led[p] : p;
 
-			hue_to_rgb(hue, fx_level, cur[ring_led[p]]);
+		if (hue_color(hue, e, cur[led]))
+			lim_bits |= (uint16_t)(1U << led);
+		if (!fx_ring) {
+			memcpy(cur[NROWS + p], cur[p], sizeof(cur[p]));
+			if (lim_bits >> p & 1)
+				lim_bits |= (uint16_t)(1U << (NROWS + p));
 		}
-		return;
-	}
-	for (int r = 0; r < NROWS; r++) {
-		uint32_t hue = (r * (1536U / NROWS) + 1536U - phase) % 1536U;
-
-		hue_to_rgb(hue, fx_level, cur[r]);
-		memcpy(cur[NROWS + r], cur[r], sizeof(cur[r]));
 	}
 }
 
@@ -558,10 +765,17 @@ void leds_tick(void)
 {
 	uint32_t now = millis();
 	int32_t target[NLEDS][NCOLORS];
-	int32_t one[NCOLORS];
+	uint32_t one[NCOLORS], full[NCOLORS], to[NLEDS][NCOLORS];
 
 	if (now - last_tick < TICK_MS)
 		return;
+	if (fx_frozen) {	/* FX FREEZE: hold the effect clock and the ramp */
+		fx_t0 += now - last_tick;
+		ramp_start += now - last_tick;
+	}
+	fx_t0 -= fx_step_ms;	/* FX STEP */
+	ramp_start -= fx_step_ms;
+	fx_step_ms = 0;
 	last_tick = now;
 
 	switch (fx) {
@@ -569,7 +783,8 @@ void leds_tick(void)
 		base_color(target);
 		if (memcmp(target, base_target, sizeof(target)) != 0) {
 			memcpy(base_target, target, sizeof(target));
-			start_ramp(target, smooth_ms);
+			levels_to_duties(target, to);
+			start_ramp(to, smooth_ms, 0);
 		}
 		run_ramp();
 		break;
@@ -582,23 +797,24 @@ void leds_tick(void)
 		uint32_t t = (now - fx_t0) % (fx_a + fx_b);
 
 		for (int c = 0; c < NCOLORS; c++)
-			one[c] = t < fx_a ? fx_rgb[c] * FP : 0;
+			one[c] = t < fx_a ? level_to_duty(fx_rgb[c] * FP) : 0;
 		fill_all(cur, one);
+		lim_bits = 0;
 		break;
 	}
 	case FX_BREATHE: {
 		uint32_t phase = (uint32_t)((uint64_t)((now - fx_t0) % fx_a) * BREATHE_STEPS / fx_a);
-		uint32_t k = breathe_curve(phase);
 
-		for (int c = 0; c < NCOLORS; c++)
-			one[c] = (int32_t)((uint32_t)(fx_rgb[c] * FP) * k / 65535U);
+		/* the limit on the full color only, then the color dims in light */
+		lim_bits = limited_color(fx_rgb, full) ? 0xFFFF : 0;
+		scale_color(full, envelope(breathe_curve(phase)), one, true);
 		fill_all(cur, one);
 		break;
 	}
 	case FX_RAINBOW: {
 		uint32_t hue = (now - fx_t0) % fx_a * 1536 / fx_a;
 
-		hue_to_rgb(hue, fx_level, one);
+		lim_bits = hue_color(hue, level_to_duty(fx_level * FP), one) ? 0xFFFF : 0;
 		fill_all(cur, one);
 		break;
 	}
@@ -609,6 +825,7 @@ void leds_tick(void)
 		run_spectrum(now);
 		break;
 	case FX_DIRECT:
+		lim_bits = 0;
 		break;
 	}
 	apply();
@@ -701,22 +918,24 @@ void leds_pattern_clear(void)
 void leds_fx_off(void)
 {
 	int32_t target[NLEDS][NCOLORS];
+	uint32_t to[NLEDS][NCOLORS];
 
 	fx = FX_NONE;
 	base_color(target);
 	memcpy(base_target, target, sizeof(target));
-	start_ramp(target, smooth_ms);
+	levels_to_duties(target, to);
+	start_ramp(to, smooth_ms, 0);
 }
 
 void leds_fx_fade(const uint8_t rgb[3], uint32_t ms)
 {
-	int32_t to[NLEDS][NCOLORS], one[NCOLORS];
+	uint32_t to[NLEDS][NCOLORS], one[NCOLORS];
 
 	for (int c = 0; c < NCOLORS; c++)
-		one[c] = (rgb[c] > 100 ? 100 : rgb[c]) * FP;
+		one[c] = level_to_duty((rgb[c] > 100 ? 100 : rgb[c]) * FP);
 	fill_all(to, one);
 	fx = FX_FADE;
-	start_ramp(to, ms);
+	start_ramp(to, ms, 0);
 }
 
 void leds_fx_blink(const uint8_t rgb[3], uint32_t on_ms, uint32_t off_ms)
@@ -756,28 +975,25 @@ void leds_fx_chase(const uint8_t rgb[3], uint32_t period_ms)
 /*
  * FILL: a level bar from the bottom up on both sides. PERCENT 0..100
  * covers the 8 rows. The top row of the bar gets the part of a row that
- * is left, as a part of the level. A new FILL ramps over the smooth time.
+ * is left, as a part of the lightness, dimmed in light so it keeps the
+ * hue. A new FILL ramps over the smooth time.
  */
 void leds_fx_fill(const uint8_t rgb[3], unsigned percent)
 {
-	int32_t to[NLEDS][NCOLORS], lvl[NCOLORS];
+	uint32_t to[NLEDS][NCOLORS], full[NCOLORS];
 	int32_t fill = (int32_t)((percent > 100 ? 100 : percent) * NROWS * FP / 100U);
-	uint32_t full[NCOLORS];
+	bool lim;
 
-	/* the level of a full row, after the per-LED limit */
-	fx_limited = limited_color(rgb, full);
-	for (int c = 0; c < NCOLORS; c++)
-		lvl[c] = fx_limited ? duty_to_level(full[c]) : (rgb[c] > 100 ? 100 : rgb[c]) * FP;
+	/* a full row, after the per-LED limit */
+	lim = limited_color(rgb, full);
 	for (int r = 0; r < NROWS; r++) {
 		int32_t part = clamp(fill - (NROWS - 1 - r) * FP, 0, FP);	/* 0..FP */
 
-		for (int c = 0; c < NCOLORS; c++) {
-			to[r][c] = lvl[c] * part / FP;
-			to[NROWS + r][c] = to[r][c];
-		}
+		scale_color(full, level_to_duty(100 * part), to[r], true);
+		memcpy(to[NROWS + r], to[r], sizeof(to[r]));
 	}
 	fx = FX_FILL;
-	start_ramp(to, smooth_ms);
+	start_ramp(to, smooth_ms, lim ? 0xFFFF : 0);
 }
 
 void leds_fx_spectrum(uint32_t period_ms, uint8_t level, bool ring)
@@ -792,16 +1008,16 @@ void leds_fx_spectrum(uint32_t period_ms, uint8_t level, bool ring)
 /* SPLIT: one color on the right side, one on the left side */
 void leds_fx_split(const uint8_t right[3], const uint8_t left[3])
 {
-	int32_t to[NLEDS][NCOLORS];
+	uint32_t to[NLEDS][NCOLORS];
 
 	for (int r = 0; r < NROWS; r++) {
 		for (int c = 0; c < NCOLORS; c++) {
-			to[r][c] = (right[c] > 100 ? 100 : right[c]) * FP;
-			to[NROWS + r][c] = (left[c] > 100 ? 100 : left[c]) * FP;
+			to[r][c] = level_to_duty((right[c] > 100 ? 100 : right[c]) * FP);
+			to[NROWS + r][c] = level_to_duty((left[c] > 100 ? 100 : left[c]) * FP);
 		}
 	}
 	fx = FX_SPLIT;
-	start_ramp(to, smooth_ms);
+	start_ramp(to, smooth_ms, 0);
 }
 
 void leds_set_smooth(uint32_t ms)

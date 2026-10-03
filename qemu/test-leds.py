@@ -87,6 +87,12 @@ def hue_est(duty):
     return h * 256 % 1536
 
 
+def hue_scaled(duty):
+    """the hue of a color dimmed in light: the duties scaled to full first"""
+    m = max(duty)
+    return hue_est(tuple(x * 65535 // m for x in duty)) if m else None
+
+
 def hue_near(a, b, tol):
     return a is not None and b is not None and min((a - b) % 1536, (b - a) % 1536) <= tol
 
@@ -120,7 +126,9 @@ def led_get(m, arg=''):
     return None, None, None, rows
 
 
-GRP_LOWER = 4   # the GRPPWM rules of leds.c: raise to 1.5 x need, lower by 1/8 per tick from 4 x need
+GRP_LOWER = 4      # the GRPPWM rules of leds.c: raise to 1.5 x tmax / 255, coarse at 4 x need
+STEADY_TICKS = 3   # a coarse chip whose light does not fall lowers GRPPWM after this many ticks
+LOW_T = 640        # an output may go dark (rounding, LED dark as a whole, hold) below this target
 
 
 def targets(duties):
@@ -136,15 +144,13 @@ def pwm_for(t, g):
     return [0 if x == 0 else max(1, min(255, (x + g // 2) // g)) for x in t]
 
 
-def grp_for(need):
-    return min(255, (3 * need + 1) // 2)
+def grp_for(tmax):
+    return min(255, (3 * tmax + 509) // 510)
 
 
 def chip_check(duties, pwm, g, settled=True):
-    """'' when PWMx (by output) and GRPPWM g of one chip follow the rules
-    for these duties (by LED index), else the reason. A tick that is not
-    settled can still lower GRPPWM in steps of 1/8, so GRPPWM can be
-    4 x need or more."""
+    """'' when PWMx (by output) and GRPPWM g of one chip follow the rules of
+    a settled tick for these duties (by LED index), else the reason"""
     t = targets(duties)
     tmax = max(t)
     if tmax == 0:
@@ -373,7 +379,7 @@ def test_features(m):
     pix = pix_in(out.split('fx spectrum', 1)[-1])[5:]
     steps = []
     for _, p in pix:
-        h = [hue_est(p[i]) for i in RING]
+        h = [hue_scaled(p[i]) for i in RING]
         steps += [(h[(k + 1) % 16] - h[k]) % 1536 if None not in h else -1 for k in range(16)]
     check(len(pix) > 50 and steps and all(abs(x - 96) <= 12 for x in steps),
           'SPECTRUM RING: in ring order each LED is 1/16 of the hue circle after the LED before (%d..%d of 1536)' % (
@@ -383,8 +389,8 @@ def test_features(m):
         later = min(pix, key=lambda q: abs(q[0] - (t + 100)))
         if abs(later[0] - (t + 100)) > 5:
             continue
-        h0 = [hue_est(p[i]) for i in RING]
-        h1 = [hue_est(later[1][i]) for i in RING]
+        h0 = [hue_scaled(p[i]) for i in RING]
+        h1 = [hue_scaled(later[1][i]) for i in RING]
         cw += all(hue_near(h1[(k + 1) % 16], h0[k], 24) for k in range(16))
         ccw += all(hue_near(h1[(k - 1) % 16], h0[k], 24) for k in range(16))
     check(cw > 20 and ccw == 0,
@@ -574,33 +580,46 @@ def ticks_in(text):
 
 
 def grp_safe(ticks, what):
-    """the GRPPWM rules in every tick: a lit chip follows the rules, no lit
-    output goes dark for a tick, and GRPPWM goes down only in steps of 1/8
-    (at least 1) while it is 4 x need or more"""
-    dark = bad = 0
+    """the GRPPWM rules in every tick: a lower GRPPWM only in a write with
+    PWMx 0, a lit chip has GRPPWM >= need and PWMx = t / GRPPWM rounded,
+    an output goes dark only at a low target or in a write that lowers
+    GRPPWM, and a coarse chip whose light does not fall lowers GRPPWM
+    within a few ticks"""
+    bad = 0
     detail = ''
+    stay = [0, 0, 0]
+    prev = [0, 0, 0]
     for (_, _, r0), (t, p, r) in zip(ticks, ticks[1:]):
         for c in range(3):
             pwm, g = r[c]
             g0 = r0[c][1]
-            for i in range(16):
-                if p[i][c] and not pwm[OUTPUTS[i]]:
-                    dark += 1
-                    detail = detail or 'tick %d color %d: LED %d duty %d with PWMx 0' % (t, c, i, p[i][c])
-            if not any(pwm):
-                continue
-            why = chip_check([q[c] for q in p], pwm, g, settled=False)
-            tmax = max(targets([q[c] for q in p]))
+            tt = targets([q[c] for q in p])
+            tmax = max(tt)
             need = (tmax + 254) // 255
-            if not why and g < g0 and any(r0[c][0]) and g0 - g > (g0 + 7) // 8:
-                why = 'grp %d -> %d in one tick, more than 1/8' % (g0, g)
-            if not why and g >= GRP_LOWER * need and not (g < g0 and g == g0 - (g0 + 7) // 8):
-                why = 'grp %d stays at 4 x need %d or more' % (g, need)
+            why = ''
+            if g < g0 and any(pwm):
+                why = 'grp %d -> %d with PWMx lit' % (g0, g)
+            elif any(pwm) and g < need:
+                why = 'grp %d below need %d' % (g, need)
+            else:
+                for o in range(16):
+                    clamped = pwm[o] == 1 and tt[o] <= g // 2   # a lit output gets at least one step
+                    if pwm[o] and abs(pwm[o] * g - tt[o]) > g // 2 + 1 and not clamped:
+                        why = 'output %d pwm %d x grp %d for target %d' % (o, pwm[o], g, tt[o])
+                    elif tt[o] and not pwm[o] and tt[o] > LOW_T and not g < g0:
+                        why = 'output %d dark at target %d' % (o, tt[o])
+                    if why:
+                        break
+            lit_coarse = any(pwm) and g >= GRP_LOWER * need and tmax >= prev[c]
+            stay[c] = stay[c] + 1 if lit_coarse else 0
+            if not why and stay[c] > STEADY_TICKS + 1:
+                why = 'grp %d stays at 4 x need %d or more on a light that does not fall' % (g, need)
+            prev[c] = tmax
             if why:
                 bad += 1
                 detail = detail or 'tick %d color %d: %s' % (t, c, why)
-    check(len(ticks) > 20 and dark == 0 and bad == 0,
-          '%s: PWMx and GRPPWM follow the rules, GRPPWM goes down in steps of 1/8, no dark tick (%d ticks) %s' % (
+    check(len(ticks) > 20 and bad == 0,
+          '%s: GRPPWM goes down only with PWMx 0, PWMx and GRPPWM follow the rules (%d ticks) %s' % (
               what, len(ticks), detail))
 
 
@@ -617,7 +636,8 @@ def ramps_smooth(ticks, what, c=0, i=0, need_switch=True):
     for (t0, p0, r0), (t1, p1, r1) in zip(ticks, ticks[1:]):
         d0, d1 = p0[i][c], p1[i][c]
         l0, l1 = light(r0, c, i), light(r1, c, i)
-        if (d1 < d0 and l1 > l0) or (d1 > d0 and l1 < l0) or (d1 == d0 and l1 != l0):
+        tiny = max(targets([d0])[OUTPUTS[0]], targets([d1])[OUTPUTS[0]]) <= LOW_T
+        if (d1 < d0 and l1 > l0) or (d1 > d0 and l1 < l0) or (d1 == d0 and l1 != l0 and not tiny):
             wrong += 1
             detail = detail or 'tick %d: duty %d -> %d, light %d -> %d' % (t1, d0, d1, l0, l1)
         if r0[c][1] != r1[c][1] and d0 and d1:
@@ -662,6 +682,9 @@ def grp_steady(m, line, run_ms, what, settle_runs=1, runs=3, before=None):
     late = [x for x in ticks if x[0] >= t0 + settle_runs * run_ms]
     first = [x for x in ticks if x[0] < t0 + settle_runs * run_ms]
     steady = len(late) > 50 and all(grp_changes(late, c) == 0 for c in range(3))
+    dark = [(t, c, o) for t, p, r in late for c in range(3) for o in range(16)
+            if targets([q[c] for q in p])[o] and not r[c][0][o]]
+    check(not dark, '%s: no lit output goes dark after the first %d ms %s' % (what, settle_runs * run_ms, dark[:2]))
     grp = late[0][2] and [late[0][2][c][1] for c in range(3)] if late else None
     check(steady, '%s: GRPPWM %s stays the same for %d ticks (%d ms) after the first %d ms' % (
         what, grp, len(late), late[-1][0] - late[0][0] if late else 0, settle_runs * run_ms))
@@ -670,6 +693,45 @@ def grp_steady(m, line, run_ms, what, settle_runs=1, runs=3, before=None):
               what, [grp_changes(first, c) for c in range(3)]))
     grp_safe(ticks, what)
     return ticks
+
+
+def breathe_light(ticks, name, rgb):
+    """BREATHE dims the color in light: the duty ratios stay the same, the
+    peak is the color after the per-LED limit (no plateau at the limit),
+    the colors go dark together in the duties and on the chips"""
+    peak = limit_model(tuple(CIE[x] for x in rgb))
+    m = max(range(3), key=lambda c: peak[c])
+    hue = together = chips = 0
+    detail = ''
+    for t, p, r in ticks:
+        d = p[0]
+        for c in range(3):
+            want = peak[c] * d[m] / peak[m]
+            if peak[c] and abs(d[c] - want) > 1 + peak[c] / peak[m]:
+                hue += 1
+                detail = detail or 'tick %d: duties %s for the peak %s' % (t, d, peak)
+        lit = [d[c] > 0 for c in range(3) if peak[c]]
+        if any(lit) and not all(lit):
+            together += 1
+            detail = detail or 'tick %d: duties %s, not all colors lit' % (t, d)
+        on = [light(r, c, 0) > 0 for c in range(3) if peak[c]]
+        if any(on) and not all(on):
+            chips += 1
+            detail = detail or 'tick %d: lights %s, not all chips lit' % (t, [light(r, c, 0) for c in range(3)])
+    check(len(ticks) > 100 and hue == 0, '%s: the duty ratios stay those of %s in every tick %s' % (name, peak, detail))
+    check(together == 0 and chips == 0, '%s: the colors go dark and light together, in the duties and on the chips %s' % (
+        name, detail))
+    top = max(sum(p[0]) for _, p, _ in ticks)
+    at_top = sum(1 for _, p, _ in ticks if sum(p[0]) >= top - 3)
+    check(top <= led_limit() and abs(top - sum(peak)) <= sum(peak) // 500 + 3 and at_top <= len(ticks) // 25,
+          '%s: the peak %d is the limited color %d, %d of %d ticks at the top (0.1.3: about 1 in 4)' % (
+              name, top, sum(peak), at_top, len(ticks)))
+    runs = longest = 0
+    for (_, p0, _), (_, p, _) in zip(ticks, ticks[1:]):
+        runs = runs + 1 if p[0] == p0[0] and sum(p[0]) > sum(peak) // 100 else 0
+        longest = max(longest, runs)
+    check(longest <= 3, '%s: above 1 %% of the peak the duties change at least every 4 ticks (longest run %d)' % (
+        name, longest))
 
 
 def host_white(m):
@@ -727,7 +789,7 @@ def test_grppwm(m):
     check(ticks and max(ch) <= len(ticks) // 4,
           'RAINBOW: GRPPWM changes %s in %d ticks, at most 1 in 4 ticks (0.1.3: most ticks)' % (ch, len(ticks)))
 
-    for rgb in ('100 0 0', '84 38 100', '20 0 10'):
+    for rgb in ('100 0 0', '84 38 100', '17 8 20', '20 0 10'):
         all_off(m)
         out = m.cmd('FX BREATHE %s 2000' % rgb, 4.5)
         out = out.split('fx breathe', 1)[-1]
@@ -740,20 +802,38 @@ def test_grppwm(m):
                 break
             out += more
         ticks = ticks_in(out)
-        grp_safe(ticks, 'BREATHE %s 2000' % rgb)
+        name = 'BREATHE %s 2000' % rgb
+        grp_safe(ticks, name)
         for c in range(3):
             if any(p[0][c] for _, p, _ in ticks):
-                ramps_smooth(ticks, 'BREATHE %s 2000' % rgb, c)
+                ramps_smooth(ticks, name, c)
         ch = [grp_changes(ticks, c) for c in range(3)]
         check(ticks and max(ch) <= len(ticks) // 4,
-              'BREATHE %s: GRPPWM changes %s in %d ticks, at most 1 in 4 ticks' % (rgb, ch, len(ticks)))
-        # the bottom of the wave: fine steps on the chip
-        low = [(t, r[0][1], max(r[0][0])) for t, p, r in ticks if 0 < max(q[0] for q in p) <= 255]
-        check(low and all(g <= 8 for _, g, _ in low),
-              'BREATHE %s: below duty 256 the red chip runs GRPPWM 8 or less, steps of GRPPWM/65025 (%s)' % (
-                  rgb, sorted(set(g for _, g, _ in low))))
-        lit = [max(r[0][0]) * r[0][1] for t, p, r in ticks if any(r[0][0])]
-        check(lit and min(lit) < 50, 'BREATHE %s: the lowest lit step on the chip is %d of 65025' % (rgb, min(lit or [0])))
+              '%s: GRPPWM changes %s in %d ticks, at most 1 in 4 ticks' % (name, ch, len(ticks)))
+        breathe_light(ticks, name, tuple(int(x) for x in rgb.split()))
+        # the up ramp starts on fine steps of the chip
+        c0 = max(range(3), key=lambda c: int(rgb.split()[c]))
+        up = [r[c0][1] for (_, p0, _), (_, p, r) in zip(ticks, ticks[1:])
+              if p[0][c0] > p0[0][c0] and 0 < p[0][c0] <= 255]
+        check(up and max(up) <= 8, '%s: on the up ramp below duty 256 color %d runs GRPPWM 8 or less (%s)' % (
+            name, c0, sorted(set(up))))
+        lit = [max(r[c0][0]) * r[c0][1] for t, p, r in ticks if any(r[c0][0])]
+        check(lit and min(lit) < 50, '%s: the lowest lit step on the chip is %d of 65025' % (name, min(lit or [0])))
+
+    # FADE to a color and to black: a straight line in light, the hue stays
+    for line, end in (('FX FADE 84 38 100 800', (84, 38, 100)), ('FX FADE 0 0 0 800', (84, 38, 100))):
+        if end and 'FADE 84' in line:
+            all_off(m)
+        out = m.cmd(line, 1.6)
+        ticks = ticks_in(out.split('fx fade', 1)[-1])
+        peak = limit_model(tuple(CIE[x] for x in end))
+        bad = [(t, p[0]) for t, p, _ in ticks
+               if p[0][2] and abs(p[0][0] - peak[0] * p[0][2] / peak[2]) > 1 + peak[0] / peak[2]]
+        check(len(ticks) > 30 and not bad, '%s: the duty ratios stay those of %s (%s)' % (line, peak, bad[:2]))
+        grp_safe(ticks, line)
+        mono = [(t, p[0]) for (_, p0, _), (t, p, _) in zip(ticks, ticks[1:])
+                if ('FADE 0' in line and sum(p[0]) > sum(p0[0])) or ('FADE 84' in line and sum(p[0]) < sum(p0[0]))]
+        check(not mono, '%s: the light moves in one direction (%s)' % (line, mono[:2]))
 
     m.cmd('FX OFF', 0.1)
     m.cmd('TRACE OFF', 0.3)

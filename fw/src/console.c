@@ -175,7 +175,8 @@ static void cmd_help(void)
 		"FX RAINBOW MS [LEVEL] | SMOOTH MS | CAP PERCENT\r\n"
 		"FX CHASE R G B MS | FILL R G B PERCENT\r\n"
 		"FX SPECTRUM MS [LEVEL] [RING|ROWS]   RING (default) turns around the bar\r\n"
-		"FX SPLIT R G B R G B      right side color, left side color\r\n");
+		"FX SPLIT R G B R G B      right side color, left side color\r\n"
+		"FX FREEZE ON|OFF | STEP MS  stop the effect clock, move it forward\r\n");
 }
 
 static void cmd_status(void)
@@ -448,6 +449,15 @@ static void cmd_fx(int argc, char **argv)
 	} else if (eq(argv[1], "SPLIT") && argc >= 8 && rgb_args(argv + 2, rgb) &&
 		   rgb_args(argv + 5, rgb2)) {
 		leds_fx_split(rgb, rgb2);
+	} else if (eq(argv[1], "FREEZE")) {
+		if (argc > 2)
+			leds_freeze(!eq(argv[2], "OFF"));
+		console_printf("freeze %s\r\n", leds_frozen() ? "on" : "off");
+		return;
+	} else if (eq(argv[1], "STEP") && argc >= 3 && num_arg(argv[2], 1, 600000, &a)) {
+		leds_step((uint32_t)a);
+		console_printf("step %ld ms\r\n", a);
+		return;
 	} else if (eq(argv[1], "SMOOTH") && argc >= 3 && num_arg(argv[2], 0, 60000, &a)) {
 		leds_set_smooth((uint32_t)a);
 	} else if (eq(argv[1], "CAP") && argc >= 3 && num_arg(argv[2], 10, 150, &a)) {
