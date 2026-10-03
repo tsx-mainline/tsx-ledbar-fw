@@ -22,6 +22,7 @@ FLAGS = ['-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Wshadow', '-Werror',
 # test file: the firmware sources it needs
 TESTS = {
     'test_guard.c': ['guard.c', 'errlog.c'],
+    'test_i2c.c': ['i2c_tlc.c', 'errlog.c'],
 }
 
 
@@ -39,6 +40,9 @@ class FirmwareHost(unittest.TestCase):
 
     def test_guard(self):
         self.build_run('test_guard.c')
+
+    def test_i2c(self):
+        self.build_run('test_i2c.c')
 
 
 if __name__ == '__main__':

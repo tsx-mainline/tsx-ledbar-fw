@@ -9,4 +9,5 @@
 #include <stdint.h>
 
 extern uint32_t fake_rcc_csr;
+extern volatile uint32_t fake_i2c_sr1, fake_i2c_sr2, fake_i2c_cr1;
 #endif

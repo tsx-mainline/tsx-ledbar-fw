@@ -120,17 +120,30 @@ static void i2c_fail(void)
 	i2c_setup();
 }
 
+#define ADDR_ERRORS	(I2C_SR1_AF | I2C_SR1_ARLO | I2C_SR1_BERR)
+
+/*
+ * START and the address. The address phase ends with ADDR (ACK), AF (no
+ * ACK: chip absent or not ready), ARLO (arbitration lost: the peripheral
+ * drops to slave mode and sets neither ADDR nor AF) or BERR (a bus error).
+ * A glitch can also give none of them, so the wait has the same time
+ * limit as the other phases. On a failure the caller runs i2c_fail (bus
+ * recovery) and tlc_write adds an ERRLOG entry.
+ */
 static bool i2c_start_addr(uint8_t addr, bool read)
 {
+	uint32_t start, sr1;
+
 	i2c_send_start(I2C);
 	if (!wait_flag(&I2C_SR1(I2C), I2C_SR1_SB, true))
 		return false;
 	i2c_send_7bit_address(I2C, addr, read ? I2C_READ : I2C_WRITE);
-	while (!(I2C_SR1(I2C) & I2C_SR1_ADDR)) {
-		if (I2C_SR1(I2C) & I2C_SR1_AF) {
-			I2C_SR1(I2C) &= ~I2C_SR1_AF;
+	start = millis();
+	while (!((sr1 = I2C_SR1(I2C)) & I2C_SR1_ADDR)) {
+		if ((sr1 & ADDR_ERRORS) || millis() - start > I2C_TIMEOUT_MS) {
+			I2C_SR1(I2C) &= ~ADDR_ERRORS;
 			i2c_send_stop(I2C);
-			return false;	/* no ACK: chip absent or not ready */
+			return false;
 		}
 	}
 	(void)I2C_SR2(I2C);	/* clears ADDR */
