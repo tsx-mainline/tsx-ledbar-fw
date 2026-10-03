@@ -15,24 +15,43 @@
 
 #define LINE_MAX 96
 #define ARGS_MAX 10
+#define RX_RING	512
 
 static char line[LINE_MAX];
 static unsigned line_len;
-static bool line_ready;
+static uint8_t rx_ring[RX_RING];
+static unsigned rx_head, rx_tail;
 
 static const char *const color_names[NCOLORS] = { "RED", "GREEN", "BLUE" };
 
+/*
+ * Received bytes go into a ring. One USB packet can hold more than one
+ * line, so console_poll takes the lines out of the ring one by one. When
+ * the ring is full, the rest of the data is lost.
+ */
 void console_rx(const uint8_t *data, size_t n)
 {
 	for (size_t i = 0; i < n; i++) {
-		char c = (char)data[i];
+		unsigned next = (rx_head + 1) % RX_RING;
 
-		if (line_ready)
-			break;		/* one line at a time */
+		if (next == rx_tail)
+			break;
+		rx_ring[rx_head] = data[i];
+		rx_head = next;
+	}
+}
+
+/* move bytes from the ring into the line: true when a line is complete */
+static bool line_from_ring(void)
+{
+	while (rx_tail != rx_head) {
+		char c = (char)rx_ring[rx_tail];
+
+		rx_tail = (rx_tail + 1) % RX_RING;
 		if (c == '\r' || c == '\n') {
 			if (line_len) {
 				line[line_len] = 0;
-				line_ready = true;
+				return true;
 			}
 			continue;
 		}
@@ -44,6 +63,7 @@ void console_rx(const uint8_t *data, size_t n)
 		if (line_len < LINE_MAX - 1 && c >= ' ')
 			line[line_len++] = c;
 	}
+	return false;
 }
 
 static bool eq(const char *a, const char *b)
@@ -449,15 +469,20 @@ static void cmd_fx(int argc, char **argv)
 
 #ifdef TSX_QEMU
 /*
- * QEMU build only: events that the QEMU machine cannot make, for the
- * tests of the start guard. HOST: a host runs on the bus (bus reset and
- * SOF packets), with no configuration. CONFIG: USB configured. FAULT: a
+ * QEMU build only: events that the QEMU machine cannot make. For the
+ * tests of the start guard: HOST, a host runs on the bus (bus reset and
+ * SOF packets) with no configuration. CONFIG: USB configured. FAULT: a
  * hard fault. RESET: a reset that the firmware did not plan, as the
- * watchdog gives (QEMU has no watchdog model).
+ * watchdog gives (QEMU has no watchdog model). For the console: RX gives
+ * three lines to console_rx in one call, as one USB packet does.
  */
 static void cmd_test(const char *what)
 {
-	if (eq(what, "HOST")) {
+	static const char three[] = "VER\r\nUPTIME\r\nCAPS\r\n";
+
+	if (eq(what, "RX")) {
+		console_rx((const uint8_t *)three, sizeof(three) - 1);
+	} else if (eq(what, "HOST")) {
 		guard_usb_host();
 	} else if (eq(what, "CONFIG")) {
 		guard_usb_configured();
@@ -466,7 +491,7 @@ static void cmd_test(const char *what)
 	} else if (eq(what, "RESET")) {
 		system_reset();
 	} else {
-		console_write("usage: TEST HOST|CONFIG|FAULT|RESET\r\n");
+		console_write("usage: TEST HOST|CONFIG|FAULT|RESET|RX\r\n");
 		return;
 	}
 	console_printf("test %s\r\n", what);
@@ -564,14 +589,14 @@ static void run_line(void)
 void console_init(void)
 {
 	line_len = 0;
-	line_ready = false;
+	rx_head = rx_tail = 0;
 }
 
+/* run each complete line in the ring */
 void console_poll(void)
 {
-	if (!line_ready)
-		return;
-	run_line();
-	line_len = 0;
-	line_ready = false;
+	while (line_from_ring()) {
+		run_line();
+		line_len = 0;
+	}
 }

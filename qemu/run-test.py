@@ -196,6 +196,10 @@ def main():
               'the refused commands leave the chip registers as they were')
         out = m.cmd('NOSUCH')
         check('unknown command' in out, 'unknown command is reported')
+        # one USB packet can hold several lines: TEST RX gives three lines in one console_rx call
+        out = m.cmd('TEST RX')
+        check('TSX-LEDBAR [v' in out and re.search(r'^\d+ ms\r?$', out, re.M) and 'tsx-ledbar fade' in out,
+              'three lines in one receive call all run: %s' % out.strip().replace('\r\n', ' | '))
         out = m.cmd('ERRLOG')
         check(out.strip().startswith('0 errors'), 'ERRLOG starts empty: %s' % out.strip())
 
