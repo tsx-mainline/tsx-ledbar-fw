@@ -219,9 +219,26 @@ static void set_config_cb(usbd_device *d, uint16_t wValue)
 	guard_usb_configured();
 }
 
+/*
+ * The guard must know when a host runs on the bus. A bus reset alone does
+ * not tell it: a host that powers up or goes down can give a short reset.
+ * A running host sends a SOF packet every millisecond, and the core keeps
+ * the frame number of the last SOF in DSTS. So a new frame number after a
+ * bus reset tells that a host runs.
+ */
+static bool sof_wait;		/* a bus reset came, no SOF after it yet */
+static uint32_t sof_frame;
+
+static uint32_t frame_number(void)
+{
+	return (OTG_FS_DSTS >> 8) & 0x3FFF;	/* FNSOF */
+}
+
 static void reset_cb(void)
 {
 	configured = false;
+	sof_wait = true;
+	sof_frame = frame_number();
 }
 
 /*
@@ -394,6 +411,10 @@ void usb_debug_state(uint32_t v[7])
 void usb_poll(void)
 {
 	usbd_poll(dev);
+	if (sof_wait && frame_number() != sof_frame) {
+		sof_wait = false;
+		guard_usb_host();
+	}
 	if (!configured)
 		return;
 	pump_console();

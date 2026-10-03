@@ -79,16 +79,100 @@ def leds_in(text):
     return [tuple(int(x) for x in m) for m in re.findall(r'led (\d+) (\d+) (\d+) (\d+)\r?\n', text)]
 
 
+START = r'qemu start (\d+) mailbox 0x([0-9A-F]+) fails (\d+)'
+
+
+def restart(m, what, timeout=15):
+    """wait for the banner of the next start: (start, mailbox, fails) or None"""
+    text, hit = m.wait_for(START, timeout)
+    if hit is None:
+        print(text)
+        return None
+    return int(hit.group(1)), hit.group(2), int(hit.group(3))
+
+
+def errlog(m):
+    out = m.cmd('ERRLOG')
+    return out, [(int(a), int(b, 16)) for a, b in re.findall(r'subsystem (\d+) cause 0x([0-9A-F]+)', out)]
+
+
+def test_guard(m):
+    """The start guard (fw/src/guard.c). QEMU has no USB and no watchdog
+    model. TEST HOST, TEST CONFIG, TEST FAULT and TEST RESET make the
+    events. The QEMU build uses a USB time of 20000 ms."""
+    # planned resets are not failed starts
+    for n in (2, 3, 4):
+        m.send('REBOOT')
+        r = restart(m, 'REBOOT')
+        check(r is not None and r[0] == n and r[2] == 0 and r[1] != '00475055',
+              'REBOOT: start %d, no failed start, no handover: %s' % (n, r))
+    # a start without a host runs on: no reset, no failed start
+    out = m.read_for(4.0)
+    check('qemu start' not in out, 'no host for longer than the USB time: the firmware does not reset')
+    out = m.cmd('STATUS')
+    up = re.search(r'uptime (\d+) ms start (\d+) fails (\d+)', out)
+    check(up is not None and int(up.group(1)) > 20000 and up.group(2) == '4' and up.group(3) == '0',
+          'STATUS after the USB time without a host: %s' % (up.group(0) if up else out.strip()))
+
+    # a host runs, no configuration: a failed start after the USB time
+    for n in (1, 2, 3):
+        check('test HOST' in m.cmd('TEST HOST', 0.2), 'TEST HOST %d' % n)
+        r = restart(m, 'USB rule', 20)
+        check(r is not None and r[2] == n and r[1] != '00475055',
+              'a host ran without a USB configuration: reset, failed start %d: %s' % (n, r))
+        if n == 1:
+            out, log = errlog(m)
+            check((125, 0) in log and (122, 1) in log,
+                  'ERRLOG shows the USB rule (125) and the count (122, 1): %s' % log)
+    m.cmd('TEST HOST', 0.2)
+    r = restart(m, 'handover', 20)
+    check(r is not None and r[1] == '00475055' and r[2] == 0,
+          'the fourth failed start hands over: mailbox UPG, count 0: %s' % (r,))
+    out, log = errlog(m)
+    check(log == [], 'ERRLOG is empty after the handover: %s' % log)
+
+    # a reset that the firmware did not plan (the watchdog on the bar) is a failed start
+    m.send('TEST RESET')
+    r = restart(m, 'unplanned reset')
+    check(r is not None and r[2] == 1, 'an unplanned reset is a failed start: %s' % (r,))
+    out, log = errlog(m)
+    check((121, 1) in log and (122, 1) in log, 'ERRLOG shows the unplanned reset (121) and the count: %s' % log)
+    out = m.cmd('TEST CONFIG')
+    check(re.search(r'start \d+ fails 0', m.cmd('STATUS')) is not None, 'USB configured sets the count to 0')
+
+    # a hard fault resets at once and is a failed start
+    m.send('TEST FAULT')
+    r = restart(m, 'hard fault')
+    check(r is not None and r[2] == 1, 'a hard fault is a failed start: %s' % (r,))
+    out, log = errlog(m)
+    check((124, 0) in log, 'ERRLOG shows the hard fault (124): %s' % log)
+    m.send('REBOOT')
+    r = restart(m, 'REBOOT after a failed start')
+    check(r is not None and r[2] == 1, 'REBOOT keeps the count of failed starts: %s' % (r,))
+    m.read_for(3.5)
+    out = m.cmd('STATUS')
+    check(re.search(r'start \d+ fails 0', out) is not None and 'qemu start' not in out,
+          'a start that runs the USB time without a host sets the count to 0')
+    # a host after that time still starts the USB rule
+    m.cmd('TEST HOST', 0.2)
+    r = restart(m, 'late host', 20)
+    check(r is not None and r[2] == 1, 'a host after the USB time without a configuration: failed start 1: %s' % (r,))
+
+    m.send('IMGUPD')
+    r = restart(m, 'IMGUPD')
+    check(r is not None and r[1] == '00475055' and r[2] == 1, 'IMGUPD writes UPG and resets, the count stays: %s' % (r,))
+
+
 def main():
     elf = sys.argv[1]
     m = Machine(elf)
     try:
-        text, hit = m.wait_for(r'tsx-ledbar qemu start (\d+) mailbox 0x([0-9A-F]+)', 15)
+        text, hit = m.wait_for(r'tsx-ledbar ' + START, 15)
         check(hit is not None, 'firmware starts and prints its banner')
         if not hit:
             print(text)
             return 1
-        check(hit.group(1) == '1', 'first start is start 1')
+        check(hit.group(1) == '1' and hit.group(3) == '0', 'first start is start 1, no failed start')
 
         out = m.cmd('VER')
         check('TSX-LEDBAR [v' in out, 'VER answers with the firmware name: %s' % out.strip())
@@ -184,24 +268,7 @@ def main():
         m.cmd('FX OFF')
         m.cmd('TRACE OFF')
 
-        # the guard: three starts without "USB configured" (never in QEMU),
-        # then the fourth start asks for the bootloader (mailbox "UPG")
-        for n in (2, 3):
-            m.send('REBOOT')
-            text, hit = m.wait_for(r'qemu start (\d+) mailbox 0x([0-9A-F]+)', 10)
-            check(hit is not None and hit.group(1) == str(n), 'REBOOT: start %d (mailbox 0x%s)' % (n, hit.group(2) if hit else '?'))
-        out = m.cmd('ERRLOG')
-        check('subsystem 122' in out, 'ERRLOG holds the guard entry: %s' % out.strip().replace('\n', ' | '))
-        m.send('REBOOT')
-        text, hit = m.wait_for(r'qemu start (\d+) mailbox 0x([0-9A-F]+)', 10)
-        check(hit is not None and hit.group(1) == '1' and hit.group(2) == '00475055',
-              'fourth start: guard wrote UPG to the mailbox and reset (start %s, mailbox 0x%s)' % (
-                  hit.group(1) if hit else '?', hit.group(2) if hit else '?'))
-        out = m.cmd('ERRLOG')
-        check(out.strip().startswith('0 errors'), 'ERRLOG is empty after the guard reset')
-        m.send('IMGUPD')
-        text, hit = m.wait_for(r'qemu start (\d+) mailbox 0x([0-9A-F]+)', 10)
-        check(hit is not None and hit.group(2) == '00475055', 'IMGUPD writes UPG and resets')
+        test_guard(m)
     finally:
         m.close()
     print('%s: %d failures' % (os.path.basename(elf), failures))

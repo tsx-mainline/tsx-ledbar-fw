@@ -31,20 +31,27 @@ uint32_t millis(void);
 void delay_ms(uint32_t ms);
 void system_reset(void);
 
-/* guard.c */
-void guard_boot(void);
+/* guard.c: the start guard */
+void guard_boot(void);			/* first at start: watchdog, failed start count */
+void guard_report(void);		/* error log entries about the last start */
+void guard_poll(void);			/* main loop: the USB rule */
+void guard_usb_host(void);		/* SOF packets after a bus reset: a host runs */
 void guard_usb_configured(void);
 void guard_kick(void);
+void guard_reboot(void);		/* REBOOT: a planned reset */
 void guard_request_bootloader(void);	/* IMGUPD: mailbox "UPG", reset */
 uint32_t guard_reset_flags(void);
-uint32_t guard_start_count(void);
+uint32_t guard_start_count(void);	/* this start since power-on */
+uint32_t guard_fails(void);		/* failed starts in a row */
 
 /* errlog.c */
 #define ERR_TLC_INIT		119	/* LED driver chip did not answer */
 #define ERR_I2C			120
-#define ERR_WATCHDOG		121
-#define ERR_GUARD		122
-#define ERR_USB			123
+#define ERR_WATCHDOG		121	/* the last start ended in a reset that was not planned */
+#define ERR_GUARD		122	/* cause: failed starts in a row */
+#define ERR_USB			123	/* cause: the IN endpoint that was stuck */
+#define ERR_FAULT		124	/* the last start ended in a hard fault */
+#define ERR_NOCONFIG		125	/* the last start: a host ran, no USB configuration */
 void errlog_add(uint16_t subsystem, uint16_t cause);
 int errlog_count(void);
 void errlog_clear(void);

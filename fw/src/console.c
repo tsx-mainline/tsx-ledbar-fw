@@ -197,11 +197,11 @@ static void cmd_status(void)
 		       pwm[0], grp[0], pwm[1], grp[1], pwm[2], grp[2]);
 	console_printf("leds %s%s (LED GET shows each LED)\r\n", s->pattern_on ? "pattern" : "host",
 		       s->limited ? " limit" : "");
-	console_printf("chips %s %s %s uptime %lu ms start %lu reset flags 0x%08lX errors %d\r\n",
+	console_printf("chips %s %s %s uptime %lu ms start %lu fails %lu reset flags 0x%08lX errors %d\r\n",
 		       tlc_ready(RED) ? "ok" : "BAD", tlc_ready(GREEN) ? "ok" : "BAD",
 		       tlc_ready(BLUE) ? "ok" : "BAD", (unsigned long)millis(),
-		       (unsigned long)guard_start_count(), (unsigned long)guard_reset_flags(),
-		       errlog_count());
+		       (unsigned long)guard_start_count(), (unsigned long)guard_fails(),
+		       (unsigned long)guard_reset_flags(), errlog_count());
 }
 
 static void cmd_tlc(int argc, char **argv)
@@ -459,6 +459,32 @@ static void cmd_fx(int argc, char **argv)
 	console_printf("fx %s\r\n", leds_fx_name());
 }
 
+#ifdef TSX_QEMU
+/*
+ * QEMU build only: events that the QEMU machine cannot make, for the
+ * tests of the start guard. HOST: a host runs on the bus (bus reset and
+ * SOF packets), with no configuration. CONFIG: USB configured. FAULT: a
+ * hard fault. RESET: a reset that the firmware did not plan, as the
+ * watchdog gives (QEMU has no watchdog model).
+ */
+static void cmd_test(const char *what)
+{
+	if (eq(what, "HOST")) {
+		guard_usb_host();
+	} else if (eq(what, "CONFIG")) {
+		guard_usb_configured();
+	} else if (eq(what, "FAULT")) {
+		__builtin_trap();
+	} else if (eq(what, "RESET")) {
+		system_reset();
+	} else {
+		console_write("usage: TEST HOST|CONFIG|FAULT|RESET\r\n");
+		return;
+	}
+	console_printf("test %s\r\n", what);
+}
+#endif
+
 static void run_line(void)
 {
 	char *argv[ARGS_MAX + 1];
@@ -500,7 +526,7 @@ static void run_line(void)
 	} else if (eq(argv[0], "REBOOT")) {
 		console_write("Rebooting\r\n");
 		delay_ms(50);
-		system_reset();
+		guard_reboot();
 	} else if (eq(argv[0], "IMGUPD")) {
 		if (argc > 1 && eq(argv[1], "?")) {
 			console_write(" IMGUPD - reboot into bootloader\r\n");
@@ -539,6 +565,8 @@ static void run_line(void)
 		leds_trace = leds_trace_pix || (argc > 1 && eq(argv[1], "ON"));
 		console_printf("trace %s\r\n", leds_trace_regs ? "regs" : leds_trace_pix ? "pix" :
 			       leds_trace ? "on" : "off");
+	} else if (eq(argv[0], "TEST")) {
+		cmd_test(argc > 1 ? argv[1] : NULL);
 #endif
 	} else {
 		console_printf("unknown command: %s (HELP for a list)\r\n", argv[0]);
