@@ -13,6 +13,8 @@ IMAGE=${TSX_LEDBAR_FW_IMAGE:-/usr/share/tsx-ledbar-fw/tsx-ledbar.upg}
 MARKER=${TSX_LEDBAR_FW_MARKER:-/data/tsx/ledbar-fw.installed}
 FLASH=${TSX_LEDBAR_FLASH:-tsx-ledbar-flash}
 LIB=${TSX_LEDBAR_FW_LIB:-/usr/local/lib/tsx-ledbar-fw}
+LEDS=${TSX_LEDBAR_LEDS:-/sys/class/leds/tsx:rgb:bar}
+USB=${TSX_LEDBAR_USB:-/sys/bus/usb/devices}
 
 die() { echo "tsx-ledbar-fw-install: $*" >&2; exit 1; }
 
@@ -32,20 +34,35 @@ restart_bar_users() {
 }
 
 bar_firmware() {
-	cat /sys/class/leds/tsx:rgb:bar/firmware 2>/dev/null
+	cat "$LEDS"/firmware 2>/dev/null
 }
 
+# true when the bar is on USB in bootloader mode (14be:001a)
+bar_in_bootloader() {
+	for d in "$USB"/*; do
+		[ "$(cat "$d"/idVendor 2>/dev/null)" = 14be ] &&
+			[ "$(cat "$d"/idProduct 2>/dev/null)" = 001a ] && return 0
+	done
+	return 1
+}
+
+# the version in the image header. Fails when the image fails its checks.
 image_version() {
-	python3 "$LIB"/tsx-upg.py info "$1" | sed -n 's/^ *version *ok *//p'
+	info=$(python3 "$LIB"/tsx-upg.py info "$1") || return 1
+	echo "$info" | sed -n 's/^ *version *ok *//p'
 }
 
 case $1 in
 --check)
-	want=$(image_version "$IMAGE") || die "cannot read $IMAGE"
+	want=$(image_version "$IMAGE") && [ -n "$want" ] ||
+		die "cannot read the version of $IMAGE"
 	have=$(bar_firmware)
 	case $have in
 	*"TSX-LEDBAR [v$want]"*) echo "bar runs tsx-ledbar $want"; exit 0;;
-	"") die "no LED bar found";;
+	"")
+		bar_in_bootloader &&
+			die "the LED bar is in bootloader mode. Run tsx-ledbar-fw-install to load the firmware"
+		die "no LED bar found";;
 	*) echo "bar runs \"$have\", package has $want"; exit 1;;
 	esac;;
 "") ;;
