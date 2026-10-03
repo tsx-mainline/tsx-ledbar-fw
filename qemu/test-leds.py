@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Tests of the 16 LEDs (0.1.3): the LED map, the LED pattern commands,
-the power cap over all LEDs, the per-output dimming values, the zone
-effects, and the one-color behavior of 0.1.2.
+the per-LED limit and the cap over all LEDs, the per-output dimming
+values, the zone effects, and the one-color behavior of 0.1.2.
 
   qemu/test-leds.py NEW.elf [REF.elf]
 
@@ -26,6 +26,7 @@ Machine, leds_in = rt.Machine, rt.leds_in
 
 NAMES = ['R%d' % n for n in range(1, 9)] + ['L%d' % n for n in range(1, 9)]
 OUTPUTS = [15, 6, 0, 1, 2, 3, 4, 5, 14, 13, 12, 11, 10, 9, 8, 7]
+RING = list(range(8)) + list(range(15, 7, -1))  # R1..R8, L8..L1: clockwise from the front
 CIE = [0, 73, 145, 218, 290, 363, 435, 508, 580, 656,
        738, 826, 922, 1024, 1134, 1251, 1376, 1509, 1650, 1800,
        1959, 2127, 2304, 2491, 2687, 2894, 3111, 3338, 3576, 3826,
@@ -41,8 +42,51 @@ CIE = [0, 73, 145, 218, 290, 363, 435, 508, 580, 656,
 check = rt.check
 
 
+def led_limit(percent=110):
+    return percent * 65535 // 100
+
+
 def cap_total(percent=110):
-    return 16 * (percent * 65535 // 100)
+    return 16 * led_limit(percent)
+
+
+def limit_model(d, percent=110):
+    """the per-LED limit: one factor for the three duties of one LED"""
+    lim, s = led_limit(percent), sum(d)
+    return tuple(x * lim // s for x in d) if s > lim else tuple(d)
+
+
+def bar_cap_model(px, percent=110):
+    """the cap over all LEDs alone: one factor for all 48 duties"""
+    cap, s = cap_total(percent), sum(map(sum, px))
+    return [tuple(x * cap // s for x in p) for p in px] if s > cap else list(px)
+
+
+def level_of(d):
+    """the level 0..100 (a float) of a duty, the inverse of the CIE table"""
+    for i in range(100):
+        if d < CIE[i + 1]:
+            return i + (d - CIE[i]) / (CIE[i + 1] - CIE[i])
+    return 100.0
+
+
+def hue_est(duty):
+    """the hue 0..1535 of one LED (6 x 256, as the firmware), None when dark"""
+    r, g, b = (level_of(x) for x in duty)
+    mx, mn = max(r, g, b), min(r, g, b)
+    if mx == 0 or mx == mn:
+        return None
+    if mx == r:
+        h = (g - b) / (mx - mn)
+    elif mx == g:
+        h = 2 + (b - r) / (mx - mn)
+    else:
+        h = 4 + (r - g) / (mx - mn)
+    return h * 256 % 1536
+
+
+def hue_near(a, b, tol):
+    return a is not None and b is not None and min((a - b) % 1536, (b - a) % 1536) <= tol
 
 
 def pix_in(text):
@@ -65,10 +109,10 @@ def led_get(m, arg=''):
     head = re.search(r'leds (\w+) fx (\w+) grp (\d+) (\d+) (\d+)', out)
     rows = {}
     for r in re.finditer(r'(\d+) ([RL][1-8]) out (\d+) level (\d+) (\d+) (\d+) duty (\d+) (\d+) (\d+) '
-                         r'pwm (\d+) (\d+) (\d+)', out):
-        v = [int(x) for x in r.groups()[2:]]
+                         r'pwm (\d+) (\d+) (\d+)( limit)?\r?\n', out):
+        v = [int(x) for x in r.groups()[2:12]]
         rows[int(r.group(1))] = {'name': r.group(2), 'out': v[0], 'level': tuple(v[1:4]),
-                                 'duty': tuple(v[4:7]), 'pwm': tuple(v[7:10])}
+                                 'duty': tuple(v[4:7]), 'pwm': tuple(v[7:10]), 'limit': bool(r.group(13))}
     if head:
         return head.group(1), head.group(2), tuple(int(x) for x in head.groups()[2:]), rows
     return None, None, None, rows
@@ -97,6 +141,15 @@ def split_012(duty):
     g = (t + 254) // 255
     p = (t + g // 2) // g
     return max(1, min(255, p)), g
+
+
+def limit_flags(m):
+    """the limit flag of LED GET (header) and of STATUS, and the limited LEDs"""
+    out = m.cmd('LED GET')
+    head = re.search(r'leds \w+ fx \w+ grp \d+ \d+ \d+( limit)?\r?\n', out)
+    rows = re.findall(r'^(\d+) [RL][1-8] out .* limit\r?$', out, re.M)
+    status = re.search(r'leds \w+( limit)? \(LED GET', m.cmd('STATUS'))
+    return (bool(head and head.group(1)), bool(status and status.group(1)), sorted(int(x) for x in rows))
 
 
 def regs_match_model(m, what):
@@ -196,20 +249,23 @@ def test_features(m):
           'all 16 LEDs white: 24029 each, as one white bar in 0.1.2')
     m.cmd('LED SET ALL 0 0 0', 0.3)
     px = last_pix(m, 'LED SIDE R 100 100 100')
-    check(px and all(p == (48058, 48058, 48058) for p in px[:8]) and all(p == (0, 0, 0) for p in px[8:]),
-          'right side white: 48058 each (sum %d, cap %d)' % (sum(map(sum, px or [])), cap_total()))
+    check(px and all(p == (24029, 24029, 24029) for p in px[:8]) and all(p == (0, 0, 0) for p in px[8:]),
+          'right side white: the per-LED limit gives 24029 each (sum %d, cap %d)' % (sum(map(sum, px or [])), cap_total()))
     px = last_pix(m, 'LED SIDE R 100 0 0')
     check(px and all(p == (65535, 0, 0) for p in px[:8]), 'right side red is under the cap: 65535 each')
     px = last_pix(m, 'FX CAP 40')
     s = sum(map(sum, px or []))
-    check(px and s <= cap_total(40) and len(set(px[:8])) == 1 and px[0][0] < 65535,
-          'FX CAP 40 scales the pattern: sum %d, cap %d' % (s, cap_total(40)))
+    check(px and s <= cap_total(40) and px[:8] == [(led_limit(40), 0, 0)] * 8,
+          'FX CAP 40 scales the pattern: each LED at the limit %d, sum %d, cap %d' % (led_limit(40), s, cap_total(40)))
     m.cmd('FX CAP 110', 0.3)
     m.cmd('LED SET ALL 100 100 100', 0.2)
     m.cmd('LED SET L1 0 0 0', 0.2)
     px = last_pix(m, 'LED SET R3 100 0 100')
     s = sum(map(sum, px or []))
-    check(px and s <= cap_total() and s > cap_total() - 48, 'a mixed pattern over the cap: sum %d, cap %d' % (s, cap_total()))
+    want = [limit_model((CIE[100],) * 3)] * 16
+    want[2], want[8] = limit_model((CIE[100], 0, CIE[100])), (0, 0, 0)
+    check(px == want and s <= cap_total(),
+          'a mixed pattern: each LED at the per-LED limit, sum %d under the cap %d' % (s, cap_total()))
 
     # the base: host color, pattern, LED CLEAR, host join, FX OFF
     all_off(m)
@@ -256,6 +312,17 @@ def test_features(m):
           'CHASE: the light of the dot stays the same (%s..%s)' % (min(light or [0]), max(light or [0])))
     check(moves and set(moves) <= {0, 1} and len(set(centers)) == 8, 'CHASE: the dot runs down over all 8 rows')
 
+    out = m.cmd('FX CHASE 100 100 100 800', 2.0)
+    pix = pix_in(out.split('fx chase', 1)[-1])[5:]  # the red dot runs until the command
+    full = limit_model((CIE[100],) * 3)[0]
+    light = [sum(p[r][c] for r in range(8)) for _, p in pix for c in range(3)]
+    check(light and min(light) > 0.97 * full and max(light) <= full,
+          'CHASE white 100: the dot keeps %d per color, %d %% of full (%s..%s)' % (
+              full, round(full * 100 / 65535), min(light or [0]), max(light or [0])))
+    check(pix and all(sum(q) <= led_limit() for _, p in pix for q in p), 'CHASE white: no LED above the per-LED limit')
+    flags = limit_flags(m)
+    check(flags[0] and flags[1], 'CHASE white: LED GET and STATUS show the limit')
+
     px = last_pix(m, 'FX FILL 0 100 0 50')
     want = [(0, 0, 0)] * 4 + [(0, 65535, 0)] * 4
     check(px == want + want, 'FILL 50: the bottom 4 rows on both sides')
@@ -272,11 +339,12 @@ def test_features(m):
     check(steps >= 10, 'FILL ramps over the smooth time (%d steps)' % steps)
     m.cmd('FX SMOOTH 0', 0.2)
 
-    out = m.cmd('FX SPECTRUM 1600', 2.0)
-    pix = pix_in(out)[5:]
-    check(len(pix) > 50 and all(p[:8] == p[8:] for _, p in pix), 'SPECTRUM: both sides the same')
-    check(pix and min(len(set(p[:8])) for _, p in pix) == 8, 'SPECTRUM: 8 different colors on a side')
-    check(pix and all(sum(map(sum, p)) <= cap_total() for _, p in pix), 'SPECTRUM: under the cap')
+    out = m.cmd('FX SPECTRUM 1600 ROWS', 2.0)
+    pix = pix_in(out.split('fx spectrum', 1)[-1])[5:]
+    check(len(pix) > 50 and all(p[:8] == p[8:] for _, p in pix), 'SPECTRUM ROWS: both sides the same')
+    check(pix and min(len(set(p[:8])) for _, p in pix) == 8, 'SPECTRUM ROWS: 8 different colors on a side')
+    check(pix and all(sum(map(sum, p)) <= cap_total() for _, p in pix), 'SPECTRUM ROWS: under the cap')
+    check(pix and all(sum(q) <= led_limit() for _, p in pix for q in p), 'SPECTRUM ROWS: no LED above the per-LED limit')
     down = up = 0
     for i, (t, p) in enumerate(pix[:len(pix) // 2]):
         later = min(pix, key=lambda s: abs(s[0] - (t + 200)))
@@ -285,10 +353,55 @@ def test_features(m):
         d = lambda a, b: max(abs(x - y) for x, y in zip(a, b))
         down += d(later[1][1], p[0]) < 4000
         up += d(later[1][0], p[1]) < 4000
-    check(down > 20 and up < down // 4, 'SPECTRUM: the colors move down one row in 200 ms (%d down, %d up)' % (down, up))
+    check(down > 20 and up < down // 4, 'SPECTRUM ROWS: the colors move down one row in 200 ms (%d down, %d up)' % (down, up))
+
+    # SPECTRUM RING: the hue circle around the bar, clockwise from the front
+    check('usage' in m.cmd('FX SPECTRUM 1600 40 UP'), 'FX SPECTRUM refuses a mode other than RING or ROWS')
+    out = m.cmd('FX SPECTRUM 1600 40', 2.0)
+    check('fx spectrum' in out, 'FX SPECTRUM MS LEVEL starts, RING is the default')
+    pix = pix_in(out.split('fx spectrum', 1)[-1])[5:]
+    steps = []
+    for _, p in pix:
+        h = [hue_est(p[i]) for i in RING]
+        steps += [(h[(k + 1) % 16] - h[k]) % 1536 if None not in h else -1 for k in range(16)]
+    check(len(pix) > 50 and steps and all(abs(x - 96) <= 12 for x in steps),
+          'SPECTRUM RING: in ring order each LED is 1/16 of the hue circle after the LED before (%d..%d of 1536)' % (
+              round(min(steps or [0])), round(max(steps or [0]))))
+    cw = ccw = 0
+    for t, p in pix[:len(pix) // 2]:
+        later = min(pix, key=lambda q: abs(q[0] - (t + 100)))
+        if abs(later[0] - (t + 100)) > 5:
+            continue
+        h0 = [hue_est(p[i]) for i in RING]
+        h1 = [hue_est(later[1][i]) for i in RING]
+        cw += all(hue_near(h1[(k + 1) % 16], h0[k], 24) for k in range(16))
+        ccw += all(hue_near(h1[(k - 1) % 16], h0[k], 24) for k in range(16))
+    check(cw > 20 and ccw == 0,
+          'SPECTRUM RING: the colors turn clockwise, one LED in 100 ms (%d clockwise, %d counterclockwise)' % (cw, ccw))
+    out = m.cmd('FX SPECTRUM 1600 RING', 1.5)
+    pix = pix_in(out.split('fx spectrum', 1)[-1])[5:]
+    check(len(pix) > 50 and all(len(set(p)) == 16 for _, p in pix), 'SPECTRUM RING at 100: 16 different colors')
+    check(pix and all(sum(q) <= led_limit() for _, p in pix for q in p) and
+          all(sum(map(sum, p)) <= cap_total() for _, p in pix),
+          'SPECTRUM RING at 100: no LED above the per-LED limit, the bar under the cap')
+    flags = limit_flags(m)
+    check(flags[0] and flags[1], 'SPECTRUM RING at 100: LED GET and STATUS show the limit')
+    out = m.cmd('FX CAP 50', 1.0)
+    pix = pix_in(out.split('fx spectrum', 1)[-1])[5:]
+    check(len(pix) > 20 and all(sum(q) <= led_limit(50) for _, p in pix for q in p),
+          'SPECTRUM RING with FX CAP 50: no LED above %d' % led_limit(50))
+    m.cmd('FX CAP 110', 0.2)
 
     px = last_pix(m, 'FX SPLIT 100 0 0 0 0 100')
     check(px == [(65535, 0, 0)] * 8 + [(0, 0, 65535)] * 8, 'SPLIT: right side red, left side blue')
+    px = last_pix(m, 'FX SPLIT 100 100 100 100 0 0')
+    check(px == [(24029, 24029, 24029)] * 8 + [(65535, 0, 0)] * 8,
+          'SPLIT white and red: the right side at the per-LED limit, the left side red at full')
+
+    px = last_pix(m, 'FX FILL 100 100 100 55')
+    check(px and px[4:8] == [px[7]] * 4 and all(abs(x - 24029) <= 300 for x in px[7]) and
+          px[3][0] == px[3][1] == px[3][2] and 0 < px[3][0] < 0.9 * px[7][0] and px[2] == (0, 0, 0),
+          'FILL white 55: full rows at the per-LED limit %s, row 4 keeps its part %s' % (px and px[7], px and px[3]))
 
     # a host join ends each new effect and returns all LEDs to the host color
     m.cmd('LED RED CONTROL 1', 0.2)
@@ -303,6 +416,74 @@ def test_features(m):
     m.cmd('TLCRESET', 0.6)
     _, _, grp, rows = led_get(m)
     check(grp and grp[0] == 255 and rows[0]['pwm'][0] == 255, 'after TLCRESET the engine writes the red chip again')
+    m.cmd('TRACE OFF')
+
+
+def test_led_limit(m):
+    """the per-LED limit: no LED gets more than FX CAP percent of one channel"""
+    m.cmd('TRACE PIX')
+    all_off(m)
+    m.cmd('LED SET ALL 0 0 0', 0.3)
+    flags = limit_flags(m)
+    check(flags == (False, False, []), 'all LEDs dark: no limit flag in LED GET and STATUS %s' % (flags,))
+
+    # one white LED at 100
+    px = last_pix(m, 'LED SET R3 100 100 100')
+    want = [(0, 0, 0)] * 16
+    want[2] = limit_model((CIE[100],) * 3)
+    check(px == want and want[2] == (24029, 24029, 24029),
+          'one white LED at 100: 24029 per color, sum %d at the limit %d (%s)' % (sum(want[2]), led_limit(), px and px[2]))
+    flags = limit_flags(m)
+    check(flags == (True, True, [2]), 'one white LED: LED GET and STATUS show the limit on R3 %s' % (flags,))
+
+    # two LEDs, only one above the limit
+    m.cmd('LED SET R3 0 0 0', 0.3)
+    m.cmd('LED SET R1 100 0 0', 0.3)
+    px = last_pix(m, 'LED SET L4 100 60 0')
+    want = [(0, 0, 0)] * 16
+    want[0] = (CIE[100], 0, 0)
+    want[11] = limit_model((CIE[100], CIE[60], 0))
+    check(px == want, 'two LEDs: R1 red 100 stays at %s, L4 at 100 60 0 scales to %s (%s %s)' % (
+        want[0], want[11], px and px[0], px and px[11]))
+    check(px and abs(px[11][1] * CIE[100] - px[11][0] * CIE[60]) <= CIE[100],
+          'L4 keeps its hue: green to red %d to %d' % (px and px[11][1], px and px[11][0]))
+    flags = limit_flags(m)
+    check(flags == (True, True, [11]), 'two LEDs: only L4 shows the limit %s' % (flags,))
+
+    # FX CAP 150 raises the limit, FX CAP 50 lowers it
+    px = last_pix(m, 'FX CAP 150')
+    check(px == [(CIE[100], 0, 0)] + [(0, 0, 0)] * 10 + [(CIE[100], CIE[60], 0)] + [(0, 0, 0)] * 4,
+          'FX CAP 150: L4 is under the limit %d and gets its full duty %s' % (led_limit(150), px and px[11]))
+    check(limit_flags(m) == (False, False, []), 'FX CAP 150: no limit flag')
+    px = last_pix(m, 'LED SET R3 100 100 100')
+    check(px and px[2] == limit_model((CIE[100],) * 3, 150) == (32767, 32767, 32767),
+          'FX CAP 150: one white LED at 100 gets 32767 per color (%s)' % (px and px[2],))
+    px = last_pix(m, 'FX CAP 50')
+    want = [(0, 0, 0)] * 16
+    want[0] = limit_model((CIE[100], 0, 0), 50)
+    want[2] = limit_model((CIE[100],) * 3, 50)
+    want[11] = limit_model((CIE[100], CIE[60], 0), 50)
+    check(px == want and want[0] == (led_limit(50), 0, 0),
+          'FX CAP 50: R1 red scales to %s, R3 white to %s, L4 to %s' % (want[0], want[2], want[11]))
+    check(limit_flags(m) == (True, True, [0, 2, 11]), 'FX CAP 50: R1, R3 and L4 show the limit')
+    m.cmd('FX CAP 110', 0.3)
+    m.cmd('TRACE OFF')
+
+
+def test_one_color_limit(m):
+    """one color on the whole bar: the per-LED limit and the cap over all
+    LEDs give the same duties, the duties of 0.1.2"""
+    m.cmd('TRACE PIX')
+    all_off(m)
+    for cap in (110, 150, 50):
+        m.cmd('FX CAP %d' % cap, 0.2)
+        for rgb in ((100, 100, 100), (100, 100, 0), (100, 50, 20), (30, 30, 30), (0, 0, 100)):
+            px = last_pix(m, 'LED SET ALL %d %d %d' % rgb)
+            duty = tuple(CIE[x] for x in rgb)
+            check(px == bar_cap_model([duty] * 16, cap) == [limit_model(duty, cap)] * 16,
+                  'one color %d %d %d at FX CAP %d: %s on all LEDs, as the cap over all LEDs alone' % (
+                      rgb + (cap, px and px[0])))
+    m.cmd('FX CAP 110', 0.2)
     m.cmd('TRACE OFF')
 
 
@@ -366,6 +547,8 @@ def main():
             print(text)
             return 1
         test_features(m)
+        test_led_limit(m)
+        test_one_color_limit(m)
         test_one_color(m)
         new_states = one_color_states(m)
     finally:
