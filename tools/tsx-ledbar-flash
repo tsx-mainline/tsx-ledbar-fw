@@ -283,12 +283,24 @@ def send_io_packet(bar, pkt):
     """Send one Cresnet packet on interface 1: through the kernel driver's
     raw attribute when it is bound, otherwise with usbdevfs."""
     if os.path.exists(LED_RAW):
-        with open(LED_RAW, 'wb') as f:
-            f.write(pkt)
+        try:
+            with open(LED_RAW, 'wb') as f:
+                f.write(pkt)
+        except OSError as e:
+            die('cannot write %s: %s' % (LED_RAW, e))
         return 'driver raw attribute'
-    bar.open(1)
+    try:
+        bar.open(1)
+    except OSError as e:
+        bar.close()
+        if e.errno == errno.EBUSY:
+            die('cannot claim USB interface 1 of the bar: a kernel driver holds it, but %s does not exist. '
+                'The driver is another version. Unbind it or update it, then try again' % LED_RAW)
+        die('cannot open USB interface 1 of the bar: %s' % e)
     try:
         bar.write(pkt)
+    except OSError as e:
+        die('cannot send on USB interface 1 of the bar: %s' % e)
     finally:
         bar.close()
     return 'usbdevfs interface 1'
@@ -479,10 +491,17 @@ def cmd_enter(args):
         log('the bar is already in bootloader mode')
         return
     service = Service(args.keep_service)
-    bar = enter_bootloader(bar, service)
-    if bar is None:
-        die('the bootloader did not enumerate')
+    try:
+        bar = enter_bootloader(bar, service)
+        if bar is None:
+            die('the bootloader did not enumerate')
+    except BaseException:
+        service.start()
+        raise
     log('bootloader on %s as 14be:%s' % (bar.sysname, bar.pid))
+    if service.stopped:
+        log('the tsx-ledbar service stays stopped while the bar is in bootloader mode. '
+            'After a load with "tsx-ledbar-flash flash FILE.upg", start it: rc-service tsx-ledbar start')
 
 
 def cmd_port_reset(args):

@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Tests of tools/tsx-ledbar-flash without a bar: the record parsing, the
 packets, and the upload to a fake bootloader."""
+import argparse
 import contextlib
+import errno
 import importlib.machinery
 import importlib.util
 import io
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, '..', 'tools')
@@ -161,6 +164,85 @@ class Upload(unittest.TestCase):
         bar.answers = []
         with self.assertRaises(SystemExit):
             quiet(flash.wait_ready, bar, 0.3)
+
+
+class FakeAppBar:
+    """A bar in application mode whose interface 1 a kernel driver holds"""
+    sysname, devnode, pid, is_app = '1-1', '/dev/bus/usb/001/002', '001b', True
+
+    def __init__(self):
+        self.closed = False
+
+    def open(self, iface=0):
+        raise OSError(errno.EBUSY, 'Device or resource busy')
+
+    def close(self):
+        self.closed = True
+
+
+class FakeService:
+    def __init__(self, keep):
+        self.stopped = False
+        self.starts = 0
+
+    def stop(self):
+        self.stopped = True
+
+    def start(self):
+        self.starts += 1
+        self.stopped = False
+
+
+class Fallback(unittest.TestCase):
+    def test_claim_busy(self):
+        bar = FakeAppBar()
+        err = io.StringIO()
+        with mock.patch.object(flash, 'LED_RAW', '/nonexistent/raw'), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit):
+                flash.send_io_packet(bar, flash.PKT_PREPARE)
+        self.assertIn('kernel driver holds it', err.getvalue())
+        self.assertTrue(bar.closed)
+
+    def run_enter(self, enter):
+        services = []
+
+        def make_service(keep):
+            services.append(FakeService(keep))
+            return services[-1]
+
+        out = io.StringIO()
+        with mock.patch.object(flash.Bar, 'find', staticmethod(lambda: FakeAppBar())), \
+                mock.patch.object(flash, 'Service', make_service), \
+                mock.patch.object(flash, 'enter_bootloader', enter), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            try:
+                flash.cmd_enter(argparse.Namespace(keep_service=False))
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, services[0], out.getvalue()
+
+    def test_enter_fails_starts_the_service(self):
+        def enter(bar, service):
+            service.stop()
+            flash.die('the bar did not restart after the prepare packet')
+        code, service, out = self.run_enter(enter)
+        self.assertEqual(code, 1)
+        self.assertEqual(service.starts, 1)
+        self.assertFalse(service.stopped)
+
+    def test_enter_says_the_service_stays_stopped(self):
+        btl = FakeAppBar()
+        btl.pid, btl.is_app = '001a', False
+
+        def enter(bar, service):
+            service.stop()
+            return btl
+        code, service, out = self.run_enter(enter)
+        self.assertEqual(code, 0)
+        self.assertEqual(service.starts, 0)
+        self.assertIn('stays stopped', out)
+        self.assertIn('rc-service tsx-ledbar start', out)
 
 
 if __name__ == '__main__':
