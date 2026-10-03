@@ -6,9 +6,10 @@ values, the zone effects, and the one-color behavior of 0.1.2.
 
   qemu/test-leds.py NEW.elf [REF.elf]
 
-NEW.elf is the QEMU build under test. With REF.elf (the QEMU build of
-0.1.2), the script also sets the same host colors on both builds and
-compares the duties and the PWM and group values.
+NEW.elf is the QEMU build under test. With REF.elf (the QEMU build of an
+earlier release with LED GET, 0.1.4 or later), the script also sets the
+same host colors on both builds and compares the duties and the PWM and
+group values. A build of 0.1.2 has no LED GET, so it cannot be REF.elf.
 
 The LED map: the firmware starts with the map of the TSW-1060-LB. The
 default start reads the variant value 1. A second machine starts with
