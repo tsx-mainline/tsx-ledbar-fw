@@ -91,6 +91,17 @@ bool usb_configured(void)
 static usbd_device *dev;
 static uint8_t control_buf[128];
 
+/* IN endpoint state, see "IN endpoint arming" below */
+struct in_ep {
+	uint8_t last[EP_SIZE];
+	uint8_t last_len;
+	uint32_t stuck_since;
+	bool stuck_seen;
+	bool resend;		/* send the last packet again when the endpoint is idle */
+};
+
+static struct in_ep in_eps[3];	/* index = endpoint number */
+
 static const struct usb_device_descriptor dev_desc = {
 	.bLength = USB_DT_DEVICE_SIZE,
 	.bDescriptorType = USB_DT_DEVICE,
@@ -219,6 +230,7 @@ static void set_config_cb(usbd_device *d, uint16_t wValue)
 		configured = false;
 		return;
 	}
+	memset(in_eps, 0, sizeof(in_eps));	/* new endpoints: no packet to send again */
 	usbd_ep_setup(d, EP_CONSOLE_OUT, USB_ENDPOINT_ATTR_BULK, EP_SIZE, console_out_cb);
 	usbd_ep_setup(d, EP_CONSOLE_IN, USB_ENDPOINT_ATTR_BULK, EP_SIZE, NULL);
 	usbd_ep_setup(d, EP_IO_OUT, USB_ENDPOINT_ATTR_BULK, EP_SIZE, io_out_cb);
@@ -293,19 +305,13 @@ void usb_init(void)
  *    unbounded waits on the core, which never end while the host does
  *    not poll. The check happens here instead, with bounded waits.
  * 3. Should an endpoint still get stuck (EPENA and NAKSTS for more than
- *    IN_STUCK_MS), it is disabled, its FIFO flushed, and the last packet
- *    is sent again. A copy of the last packet is kept for that.
+ *    IN_STUCK_MS), it is disabled and its FIFO flushed. A copy of the
+ *    last packet is kept, and it goes out again when the endpoint is idle
+ *    (EPENA clear, NAKSTS set), by rule 1. When the disable does not end
+ *    within its wait, EPENA stays set, and the endpoint is stuck again
+ *    after IN_STUCK_MS. The library write is never called with EPENA set.
  */
 #define IN_STUCK_MS	2000
-
-struct in_ep {
-	uint8_t last[EP_SIZE];
-	uint8_t last_len;
-	uint32_t stuck_since;
-	bool stuck_seen;
-};
-
-static struct in_ep in_eps[3];	/* index = endpoint number */
 
 static bool wait_bit(volatile uint32_t *reg, uint32_t mask, bool set, uint32_t ms)
 {
@@ -343,7 +349,15 @@ static bool ep_in_ready(uint8_t addr)
 
 	if (!(ctl & OTG_DIEPCTL0_EPENA)) {
 		e->stuck_seen = false;
-		return (ctl & OTG_DIEPCTL0_NAKSTS) != 0;
+		if (!(ctl & OTG_DIEPCTL0_NAKSTS))
+			return false;
+		if (e->resend) {
+			/* the packet that the recovery took off the endpoint */
+			e->resend = false;
+			usbd_ep_write_packet(dev, addr, e->last, e->last_len);
+			return false;
+		}
+		return true;
 	}
 	if (!(ctl & OTG_DIEPCTL0_NAKSTS)) {
 		e->stuck_seen = false;	/* packet in flight */
@@ -358,8 +372,7 @@ static bool ep_in_ready(uint8_t addr)
 		return false;
 	ep_in_recover(ep);
 	e->stuck_seen = false;
-	if (e->last_len && (OTG_FS_DIEPCTL(ep) & OTG_DIEPCTL0_NAKSTS))
-		usbd_ep_write_packet(dev, addr, e->last, e->last_len);
+	e->resend = e->last_len != 0;
 	return false;
 }
 
