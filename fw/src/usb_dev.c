@@ -442,7 +442,33 @@ void usb_poll(void)
 	pump_io();
 }
 
+/*
+ * Before a planned reset: poll USB for at most ms, until the console text
+ * has left the bar (the ring is empty and the IN endpoint is idle). Only
+ * usb_poll moves text to the endpoint, so a reset right after a console
+ * answer would lose the answer.
+ */
+void usb_flush(uint32_t ms)
+{
+	uint32_t start = millis();
+
+	while (millis() - start < ms) {
+		usb_poll();
+		guard_kick();
+		if (!configured)
+			return;
+		if (console_tail == console_head &&
+		    !(OTG_FS_DIEPCTL(EP_CONSOLE_IN & 0x7F) & OTG_DIEPCTL0_EPENA))
+			return;
+	}
+}
+
 #else /* TSX_QEMU: no USB model, the console runs on USART1 */
+
+void usb_flush(uint32_t ms)
+{
+	(void)ms;	/* console_write sends to the UART at once */
+}
 
 void usb_init(void)
 {

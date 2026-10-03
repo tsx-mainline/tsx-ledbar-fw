@@ -538,7 +538,7 @@ static void run_line(void)
 		console_write("error log cleared\r\n");
 	} else if (eq(argv[0], "REBOOT")) {
 		console_write("Rebooting\r\n");
-		delay_ms(50);
+		usb_flush(100);
 		guard_reboot();
 	} else if (eq(argv[0], "IMGUPD")) {
 		if (argc > 1 && eq(argv[1], "?")) {
@@ -546,7 +546,7 @@ static void run_line(void)
 			return;
 		}
 		console_write("Rebooting into the bootloader\r\n");
-		delay_ms(50);
+		usb_flush(100);
 		guard_request_bootloader();
 	} else if (eq(argv[0], "TLCRESET")) {
 		console_printf("TLC reset %s\r\n", tlc_init() ? "ok" : "FAILED");

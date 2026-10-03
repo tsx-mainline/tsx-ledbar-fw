@@ -121,6 +121,7 @@ unsigned leds_get_cap(void);
 /* usb_dev.c */
 void usb_init(void);
 void usb_poll(void);
+void usb_flush(uint32_t ms);		/* before a reset: send the console text, at most ms */
 bool usb_configured(void);
 void usb_debug_state(uint32_t v[7]);	/* DIEPCTL1, DIEPINT1, DIEPTSIZ1, GINTSTS, DAINT, console head, tail */
 /* console (interface 0) text out, Cresnet (interface 1) packets out */
