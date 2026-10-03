@@ -7,6 +7,7 @@
  *
  * LED names: R1..R8 (right side, top to bottom), L1..L8 (left side, top
  * to bottom), or the index 0..15 (R1..R8 are 0..7, L1..L8 are 8..15).
+ * The LED map (ledmap.c, LEDMAP) gives the chip output of each LED.
  */
 #include <ctype.h>
 #include <stdlib.h>
@@ -176,7 +177,8 @@ static void cmd_help(void)
 	console_write(
 		"VER                       firmware name and version\r\n"
 		"CAPS                      capabilities of this firmware\r\n"
-		"STATUS                    joins, duties, effect, uptime\r\n"
+		"STATUS                    joins, duties, effect, uptime, LED map\r\n"
+		"LEDMAP [NAME [PANEL]|DEFAULT]  LED map: show, or use another map until the next start\r\n"
 		"ERRLOG | CLEARERR         error log\r\n"
 		"REBOOT                    restart the application\r\n"
 		"IMGUPD                    restart into the bootloader (USB update mode)\r\n"
@@ -196,6 +198,50 @@ static void cmd_help(void)
 		"FX SPECTRUM MS [LEVEL] [RING|ROWS]   RING (default) turns around the bar\r\n"
 		"FX SPLIT R G B R G B      right side color, left side color\r\n"
 		"FX FREEZE ON|OFF | STEP MS  stop the effect clock, move it forward\r\n");
+}
+
+/* the LED map line of STATUS and LEDMAP: the variant pins, the map, its source */
+static void ledmap_line(void)
+{
+	console_printf("variant %u map %s %s\r\n", ledmap_variant(), ledmap_name(), ledmap_source());
+}
+
+static void print_map(const char *name)
+{
+	console_printf(" %s", name);
+}
+
+static void ledmap_list(void)
+{
+	console_write("maps");
+	ledmap_each(print_map);
+	console_write("\r\n");
+}
+
+/*
+ * LEDMAP: show the map line and the list of maps. LEDMAP NAME uses the
+ * map NAME until the next start ("outputs": LED index n is output n).
+ * tsx-ledbard adds the word PANEL. LEDMAP DEFAULT uses the default map
+ * again. ledmap.c parses the arguments.
+ */
+static void cmd_ledmap(int argc, char **argv)
+{
+	switch (ledmap_command(argc, argv)) {
+	case LEDMAP_SHOW:
+		ledmap_line();
+		ledmap_list();
+		break;
+	case LEDMAP_DONE:
+		ledmap_line();
+		break;
+	case LEDMAP_NO_MAP:
+		console_printf("no LED map %s\r\n", argv[1]);
+		ledmap_list();
+		break;
+	default:
+		console_write("usage: LEDMAP [NAME [PANEL] | DEFAULT]\r\n");
+		break;
+	}
 }
 
 static void cmd_status(void)
@@ -222,6 +268,7 @@ static void cmd_status(void)
 		       tlc_ready(BLUE) ? "ok" : "BAD", (unsigned long)millis(),
 		       (unsigned long)guard_start_count(), (unsigned long)guard_fails(),
 		       (unsigned long)guard_reset_flags(), errlog_count());
+	ledmap_line();
 }
 
 /*
@@ -533,7 +580,7 @@ static void run_line(void)
 	if (eq(argv[0], "VER") || eq(argv[0], "VERSION")) {
 		console_write(TSX_FW_NAME "\r\n");
 	} else if (eq(argv[0], "CAPS")) {
-		console_write("tsx-ledbar fade blink breathe rainbow smooth cap status leds16 chase fill spectrum split\r\n");
+		console_write("tsx-ledbar fade blink breathe rainbow smooth cap status leds16 chase fill spectrum split ledmap\r\n");
 	} else if (eq(argv[0], "HELP") || eq(argv[0], "?")) {
 		cmd_help();
 	} else if (eq(argv[0], "STATUS")) {
@@ -573,6 +620,8 @@ static void run_line(void)
 		cmd_selftest(argc, argv);
 	} else if (eq(argv[0], "LED")) {
 		cmd_led(argc, argv);
+	} else if (eq(argv[0], "LEDMAP")) {
+		cmd_ledmap(argc, argv);
 	} else if (eq(argv[0], "FX")) {
 		cmd_fx(argc, argv);
 #ifdef TSX_QEMU

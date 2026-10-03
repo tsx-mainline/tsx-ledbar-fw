@@ -17,7 +17,7 @@ UPG = $(PYTHON) ../tools/tsx-upg.py
 
 VERSION := $(shell sed -n 's/^#define TSX_VERSION_STR[[:space:]]*"\([^"]*\)".*/\1/p' src/tsx.h)
 
-SRCS = main.c board.c guard.c header.c errlog.c i2c_tlc.c leds.c usb_dev.c console.c cresnet.c qemu_uart.c
+SRCS = main.c board.c guard.c header.c errlog.c i2c_tlc.c leds.c ledmap.c usb_dev.c console.c cresnet.c qemu_uart.c
 
 CFLAGS = -Os -g -std=gnu11 -Wall -Wextra -Wshadow -Wundef -Wredundant-decls \
 	-mcpu=cortex-m3 -mthumb -msoft-float -DSTM32F2 \

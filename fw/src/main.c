@@ -3,11 +3,11 @@
  * tsx-ledbar: open firmware for the USB LED bar of the Crestron TSW-xx60
  * panels (STM32F205RC, three TLC59116 LED drivers).
  *
- * Start order: guard (watchdog and failed start count), clocks, LED chips
- * (with retries), console, Cresnet, USB. The main loop polls USB, runs
- * the console and Cresnet handlers, ticks the LED engine, runs the USB
- * rule of the guard and kicks the watchdog. guard.c tells which starts
- * count as failed.
+ * Start order: guard (watchdog and failed start count), clocks, board
+ * variant pins and the default LED map, LED chips (with retries), console,
+ * Cresnet, USB. The main loop polls USB, runs the console and Cresnet
+ * handlers, ticks the LED engine, runs the USB rule of the guard and kicks
+ * the watchdog. guard.c tells which starts count as failed.
  */
 #include "tsx.h"
 
@@ -23,6 +23,7 @@ int main(void)
 		       (unsigned long)guard_fails());
 #endif
 	guard_report();
+	ledmap_init();
 
 	delay_ms(50);		/* let the LED driver supply settle */
 	leds_init();

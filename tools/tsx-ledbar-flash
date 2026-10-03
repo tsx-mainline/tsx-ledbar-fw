@@ -57,6 +57,14 @@ PKT_END_UPDATE = bytes([DEST, 0x02, TYPE_DOWNLOAD, SUB_END_UPDATE])
 MAX_BODY = 64 - 3
 # seconds to wait for the ready packet before the prepare packet goes to the bootloader
 READY_ASK_S = 2.0
+# a prepare packet to the bootloader that times out: tries in all, and the pause between them
+PREPARE_TRIES = 3
+PREPARE_PAUSE_S = 1.0
+# seconds to wait for the ready packet after the prepare packet went out
+READY_AFTER_PREPARE_S = 3.0
+WRITE_TIMEOUT_MS = 2000
+RECOVER = ('The bar stays in bootloader mode. To recover, unplug the LED bar and plug it in again, '
+           'or run the flash again')
 
 
 def log(msg):
@@ -171,8 +179,11 @@ class Bar:
         return raw[2:raw[0]].decode('utf-16-le', 'replace')
 
     def write(self, data):
+        """One bulk OUT transfer. Returns the number of bytes sent, or 0
+        when the bar left the bus. A transfer that the bar does not take
+        within WRITE_TIMEOUT_MS raises TimeoutError (errno ETIMEDOUT)."""
         buf = ctypes.create_string_buffer(bytes(data), len(data))
-        b = Bulk(self.ep_out, len(data), 2000, ctypes.cast(buf, ctypes.c_void_p))
+        b = Bulk(self.ep_out, len(data), WRITE_TIMEOUT_MS, ctypes.cast(buf, ctypes.c_void_p))
         try:
             return fcntl.ioctl(self.fd, IOC_BULK, b)
         except OSError as e:
@@ -339,22 +350,41 @@ def wait_ready(bar, timeout_s=10):
     bootloader mode sends nothing. The bootloader answers the prepare
     packet with a new ready packet. It also sets its update state back to
     the start and erases nothing. Thus, when no ready packet comes within
-    READY_ASK_S, send the prepare packet one time."""
+    READY_ASK_S, send the prepare packet one time.
+
+    A bootloader can also refuse the prepare packet: the bulk OUT transfer
+    times out. Then try again after PREPARE_PAUSE_S, PREPARE_TRIES in all.
+    When no try goes out, stop with the steps to recover. No record was
+    sent at that point, so the load erased nothing."""
     time.sleep(0.1)
     start = time.monotonic()
     end = start + timeout_s
     size = None
-    asked = False
+    tries = 0
+    sent = False
+    ask_at = start + READY_ASK_S
     while time.monotonic() < end:
         p = bar.read(1000)
         if not p:
             if size is not None:
                 return size
-            if not asked and time.monotonic() - start >= READY_ASK_S:
-                asked = True
-                log('no ready packet within %.0f s, sending the prepare packet %s to the bootloader'
-                    % (READY_ASK_S, PKT_PREPARE.hex(' ')))
-                bar.write(PKT_PREPARE)
+            if not sent and time.monotonic() >= ask_at:
+                tries += 1
+                if tries == 1:
+                    log('no ready packet within %.0f s, sending the prepare packet %s to the bootloader'
+                        % (READY_ASK_S, PKT_PREPARE.hex(' ')))
+                try:
+                    bar.write(PKT_PREPARE)
+                    sent = True
+                    end = max(end, time.monotonic() + READY_AFTER_PREPARE_S)
+                except TimeoutError:
+                    log('the bootloader did not take the prepare packet within %d ms (try %d of %d)'
+                        % (WRITE_TIMEOUT_MS, tries, PREPARE_TRIES))
+                    if tries >= PREPARE_TRIES:
+                        die('the bootloader takes no packets: the prepare packet timed out %d times. '
+                            'No record was sent, so this load erased nothing. %s' % (PREPARE_TRIES, RECOVER))
+                    ask_at = time.monotonic() + PREPARE_PAUSE_S
+                    end = max(end, ask_at + 2 * READY_ASK_S)
             continue
         log('bootloader: %s' % pkt_text(p))
         if len(p) >= 4 and p[2] == TYPE_DOWNLOAD and p[3] == SUB_ABORT:
@@ -364,12 +394,22 @@ def wait_ready(bar, timeout_s=10):
             log('bootloader ready, block size %d' % size)
             end = time.monotonic() + 3
     if size is None:
-        die('no ready packet from the bootloader')
+        die('no ready packet from the bootloader. %s' % RECOVER)
     return size
 
 
+def send(bar, pkt, what):
+    """Send one packet in bootloader mode. A transfer that times out stops
+    the load with the steps to recover."""
+    try:
+        bar.write(pkt)
+    except TimeoutError:
+        die('the bootloader did not take %s within %d ms. The load is not complete. %s'
+            % (what, WRITE_TIMEOUT_MS, RECOVER))
+
+
 def end_block(bar, tries=60):
-    bar.write(PKT_END_BLOCK)
+    send(bar, PKT_END_BLOCK, 'the end-of-block packet')
     for _ in range(tries):
         p = bar.read(1000)
         if not p:
@@ -393,7 +433,7 @@ def upload(bar, records):
     size = wait_ready(bar)
     t0 = time.monotonic()
     tag_addr, tag_body = records[0]
-    bar.write(srec_packet(tag_body))
+    send(bar, srec_packet(tag_body), 'the tag record')
     end_block(bar)
     log('tag record accepted (%d data records follow)' % (len(records) - 1))
     blocks = 1
@@ -411,10 +451,10 @@ def upload(bar, records):
             block_start = addr
             if blocks % 16 == 0:
                 log('record %d/%d (%d%%), %d blocks' % (i, n, 100 * i // n, blocks))
-        bar.write(srec_packet(body))
+        send(bar, srec_packet(body), 'record %d' % i)
         if bar.gone:
             die('the bar left the bus during the upload (record %d)' % i)
-    bar.write(PKT_END_UPDATE)
+    send(bar, PKT_END_UPDATE, 'the end-of-update packet')
     log('all %d records sent in %d blocks, %.1f s, end of update sent' % (n, blocks, time.monotonic() - t0))
     tail = bar.drain(1000)
     if tail:
@@ -462,7 +502,11 @@ def cmd_info(args):
             text = bar.command('VER', 1000)
             show_text(text, 'ver       ')
             if 'TSX-LEDBAR' in text:
-                show_text(bar.command('CAPS', 1000), 'caps      ')
+                caps = bar.command('CAPS', 1000)
+                show_text(caps, 'caps      ')
+                if 'ledmap' in caps.split():
+                    # the LED map line: the variant value, the map and its source
+                    show_text(bar.command('LEDMAP', 1000).split('\n')[0], 'board     ')
         else:
             print('mode      bootloader')
     finally:
@@ -604,6 +648,13 @@ def main():
     args = p.parse_args()
     if os.geteuid() != 0:
         die('run as root (usbdevfs)')
+    try:
+        run(args)
+    except TimeoutError as e:
+        die('a USB transfer to the bar timed out (%s)' % e)
+
+
+def run(args):
     if args.cmd == 'info':
         cmd_info(args)
     elif args.cmd == 'flash':

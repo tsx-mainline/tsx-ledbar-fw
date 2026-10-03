@@ -4,6 +4,7 @@
  * 96 KB RAM). The application region starts at 0x08020000 (flash sector 5
  * and up). The first 256 bytes of RAM stay out of .data and .bss: the
  * bootloader mailbox is at 0x200000F4 and the two guard words follow it.
+ * The QEMU build reads its board variant pins from 0x200000F0 (ledmap.c).
  *
  * TSX_ROM_ORIGIN can be set with --defsym for the QEMU build, which runs
  * without the bootloader and starts at 0x08000000.
@@ -21,6 +22,7 @@ MEMORY
 tsx_mailbox = 0x200000F4;
 tsx_guard_magic = 0x200000F8;
 tsx_guard_state = 0x200000FC;
+tsx_qemu_variant = 0x200000F0;
 
 EXTERN (vector_table)
 ENTRY(reset_handler)

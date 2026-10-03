@@ -24,6 +24,7 @@ TESTS = {
     'test_guard.c': ['guard.c', 'errlog.c'],
     'test_i2c.c': ['i2c_tlc.c', 'errlog.c'],
     'test_cresnet.c': ['cresnet.c'],
+    'test_ledmap.c': ['ledmap.c'],
 }
 
 
@@ -47,6 +48,9 @@ class FirmwareHost(unittest.TestCase):
 
     def test_cresnet(self):
         self.build_run('test_cresnet.c')
+
+    def test_ledmap(self):
+        self.build_run('test_ledmap.c')
 
 
 if __name__ == '__main__':

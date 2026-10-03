@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Tests of the 16 LEDs (0.1.4): the LED map, the LED pattern commands,
+"""Tests of the 16 LEDs (0.1.5): the LED maps, the LED pattern commands,
 the per-LED limit and the cap over all LEDs, the per-output dimming
 values, the zone effects, and the one-color behavior of 0.1.2.
 
   qemu/test-leds.py NEW.elf [REF.elf]
 
-NEW.elf is the QEMU build under test. With REF.elf (the QEMU build of
-0.1.2), the script also sets the same host colors on both builds and
-compares the duties and the PWM and group values.
+NEW.elf is the QEMU build under test. With REF.elf (the QEMU build of an
+earlier release with LED GET, 0.1.4 or later), the script also sets the
+same host colors on both builds and compares the duties and the PWM and
+group values. A build of 0.1.2 has no LED GET, so it cannot be REF.elf.
+
+The LED map: the firmware starts with the map of the TSW-1060-LB. The
+default start reads the variant value 1. A second machine starts with
+value 5: the firmware only reports the value and uses the same map.
+LEDMAP selects a map at run time on both.
 
 TRACE PIX prints one line "pix MS" with the 48 duties (R1 red, green,
 blue, R2 red, ... L8 blue) after each engine tick. TRACE REGS also prints
@@ -198,7 +204,7 @@ def all_off(m):
 
 def test_features(m):
     out = m.cmd('VER')
-    check('[v0.1.4]' in out, 'VER is 0.1.4: %s' % out.strip())
+    check('[v0.1.5]' in out, 'VER is 0.1.5: %s' % out.strip())
     out = m.cmd('CAPS')
     check(all(w in out.split() for w in ('leds16', 'chase', 'fill', 'spectrum', 'split')),
           'CAPS lists leds16 chase fill spectrum split: %s' % out.strip())
@@ -843,6 +849,64 @@ def test_grppwm(m):
     check('usage' in m.cmd('TLCREGS PINK'), 'TLCREGS refuses a bad color')
 
 
+def chip_pwm(m, color):
+    """PWM0..15 of one chip, read from the chip with TLCREGS"""
+    r = re.search(r'%s pwm((?: \d+){16})' % color, m.cmd('TLCREGS %s' % color))
+    return [int(x) for x in r.group(1).split()] if r else None
+
+
+def lit(pwm):
+    return sorted(o for o, p in enumerate(pwm or []) if p)
+
+
+def test_ledmap(m, variant):
+    """the outputs that a LED lights with the default map, with LEDMAP
+    outputs, LEDMAP TSW-1060-LB PANEL and LEDMAP DEFAULT, and the per-LED
+    limit with another map. The variant value does not change the map."""
+    plain = list(range(16))
+    out = m.cmd('STATUS')
+    check(re.search(r'variant %d map TSW-1060-LB default' % variant, out),
+          'value %d: STATUS shows the value and the default map' % variant)
+    all_off(m)
+    m.cmd('FX SMOOTH 0', 0.1)
+    m.cmd('LED SET ALL 0 0 0', 0.3)
+    m.cmd('LED SET R1 100 0 0', 0.4)
+    check(lit(chip_pwm(m, 'RED')) == [OUTPUTS[0]], 'value %d: R1 red lights output %d: %s' % (
+        variant, OUTPUTS[0], lit(chip_pwm(m, 'RED'))))
+    m.cmd('LED SET R1 0 0 0', 0.2)
+    m.cmd('LED SET L8 0 0 100', 0.4)
+    check(lit(chip_pwm(m, 'BLUE')) == [OUTPUTS[15]] and lit(chip_pwm(m, 'RED')) == [],
+          'value %d: L8 blue lights output %d' % (variant, OUTPUTS[15]))
+    for arg, outs, what, src in (('outputs', plain, 'outputs', 'console'),
+                                 ('TSW-1060-LB PANEL', OUTPUTS, 'TSW-1060-LB', 'panel'),
+                                 ('OUTPUTS PANEL', plain, 'outputs', 'panel'),
+                                 ('DEFAULT', OUTPUTS, 'TSW-1060-LB', 'default')):
+        out = m.cmd('LEDMAP %s' % arg, 0.4)
+        check(re.search(r'variant %d map %s %s' % (variant, what, src), out),
+              'value %d, LEDMAP %s: map %s %s' % (variant, arg, what, src))
+        _, _, _, rows = led_get(m)
+        check([rows.get(i, {}).get('out') for i in range(16)] == outs and rows.get(15, {}).get('level') == (0, 0, 100),
+              'value %d, LEDMAP %s: LED GET outputs, the pattern stays' % (variant, arg))
+        check(lit(chip_pwm(m, 'BLUE')) == [outs[15]], 'value %d, LEDMAP %s: L8 moves to output %d at the next tick: %s' % (
+            variant, arg, outs[15], lit(chip_pwm(m, 'BLUE'))))
+    for arg, outs in (('outputs', plain), ('TSW-1060-LB PANEL', OUTPUTS)):
+        m.cmd('LEDMAP %s' % arg, 0.1)
+        m.cmd('FX SPLIT 100 0 0 0 0 100', 0.6)
+        check(lit(chip_pwm(m, 'RED')) == sorted(outs[:8]) and lit(chip_pwm(m, 'BLUE')) == sorted(outs[8:]),
+              'value %d, LEDMAP %s: FX SPLIT lights the right side red on %s, the left side blue on %s' % (
+                  variant, arg, sorted(outs[:8]), sorted(outs[8:])))
+    # the per-LED limit does not depend on the map
+    m.cmd('FX OFF', 0.2)
+    m.cmd('LED SET ALL 0 0 0', 0.2)
+    m.cmd('LEDMAP outputs', 0.1)
+    m.cmd('LED SET R3 100 100 100', 0.4)
+    _, _, _, rows = led_get(m)
+    check(rows.get(2, {}).get('duty') == (24029,) * 3 and rows[2].get('out') == 2 and lit(chip_pwm(m, 'GREEN')) == [2],
+          'value %d, LEDMAP outputs: one white LED R3 at the per-LED limit 24029 on output 2' % variant)
+    m.cmd('LEDMAP DEFAULT', 0.1)
+    all_off(m)
+
+
 def main():
     new = sys.argv[1]
     ref = sys.argv[2] if len(sys.argv) > 2 else None
@@ -858,7 +922,16 @@ def main():
         test_one_color_limit(m)
         test_one_color(m)
         test_grppwm(m)
+        test_ledmap(m, 1)
         new_states = one_color_states(m)
+    finally:
+        m.close()
+    m = Machine(new, 5)
+    try:
+        text, hit = m.wait_for(r'tsx-ledbar qemu start (\d+) mailbox', 15)
+        check(hit is not None, 'firmware starts with variant value 5')
+        if hit:
+            test_ledmap(m, 5)
     finally:
         m.close()
     if ref:

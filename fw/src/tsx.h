@@ -8,8 +8,8 @@
 
 #define TSX_VERSION_MAJOR	0
 #define TSX_VERSION_MINOR	1
-#define TSX_VERSION_BUILD	4
-#define TSX_VERSION_STR		"0.1.4"
+#define TSX_VERSION_BUILD	5
+#define TSX_VERSION_STR		"0.1.5"
 /* USB string 4 and the VER command: the host tools look for "TSX-LEDBAR" */
 #define TSX_FW_NAME		"TSX-LEDBAR [v" TSX_VERSION_STR "]"
 #define TSX_PRODUCT_CODE	0xE5
@@ -20,7 +20,7 @@ enum { RED, GREEN, BLUE, NCOLORS };
  * The bar has 16 RGB LEDs, 8 on each side. Output n of the red, green and
  * blue chip drives the same LED. The LED index counts by position: 0..7
  * are R1..R8 (right side, top to bottom), 8..15 are L1..L8 (left side,
- * top to bottom). leds.c holds the map from the index to the output.
+ * top to bottom). ledmap.c holds the maps from the index to the output.
  */
 #define NLEDS		16
 #define NROWS		8
@@ -75,6 +75,20 @@ bool tlc_set_out_mode(int color, int out, int mode);	/* out 0..15 or -1 = all */
 bool tlc_set_pwm(int color, int out, uint8_t duty);
 int tlc_get_out_mode(int color, int out);
 void tlc_reset_pulse(void);
+
+/* ledmap.c: the LED maps and the board variant pins */
+enum ledmap_source { LEDMAP_DEFAULT, LEDMAP_PANEL, LEDMAP_CONSOLE };
+void ledmap_init(void);			/* read the variant pins, take the default map */
+unsigned ledmap_variant(void);		/* the value of the pins, 0..7: information only */
+const char *ledmap_name(void);		/* the map in use */
+const char *ledmap_source(void);	/* "default", "panel" or "console" */
+const uint8_t *ledmap_outputs(void);	/* the map in use: output of LED index 0..15 */
+void ledmap_default(void);		/* the default map (TSW-1060-LB), source "default" */
+bool ledmap_select(const char *name, enum ledmap_source src);	/* false: no map with this name */
+void ledmap_each(void (*fn)(const char *));	/* the name of each map */
+/* the console command LEDMAP [NAME [PANEL] | DEFAULT] */
+enum ledmap_cmd { LEDMAP_SHOW, LEDMAP_DONE, LEDMAP_NO_MAP, LEDMAP_USAGE };
+enum ledmap_cmd ledmap_command(int argc, char *const *argv);
 
 /* leds.c: the LED engine */
 struct led_state {
