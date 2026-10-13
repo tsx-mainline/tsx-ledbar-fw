@@ -10,6 +10,7 @@
  * The LED map (ledmap.c, LEDMAP) gives the chip output of each LED.
  */
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "tsx.h"
@@ -24,6 +25,7 @@ static uint8_t rx_ring[RX_RING];
 static unsigned rx_head, rx_tail;
 
 static const char *const color_names[NCOLORS] = { "RED", "GREEN", "BLUE" };
+static const char *const chip_names[NCOLORS] = { "red", "green", "blue" };
 
 /*
  * Received bytes go into a ring. One USB packet can hold more than one
@@ -186,6 +188,7 @@ static void cmd_help(void)
 		"TLCOUTMODE COLOR NUM MODE, TLCGROUPMODE, TLCBRIGHTNESS   refused: use LED SET, FX\r\n"
 		"TLCRESET                  reset and init the LED driver chips\r\n"
 		"TLCREGS COLOR             read the registers of a TLC59116\r\n"
+		"I2CSCAN [RESET]           probe 0x60..0x6F, pins, I2C errors of each chip\r\n"
 		"SELFTEST LED ON|OFF [COLOR|ALL] [PERCENT]\r\n"
 		"LED COLOR LEVEL|CONTROL|BLINK VALUE   the host joins, by hand\r\n"
 		"LED SET LEDS R G B        LEDS: R1..R8, L1..L8, 0..15, A-B, R, L or ALL\r\n"
@@ -244,6 +247,155 @@ static void cmd_ledmap(int argc, char **argv)
 	}
 }
 
+/* the chips of mask by name: "red blue", or "none" */
+static const char *chip_list(uint8_t mask, char *buf, size_t n)
+{
+	size_t len = 0;
+
+	buf[0] = 0;
+	for (int c = 0; c < NCOLORS && len < n; c++) {
+		if (mask >> c & 1)
+			len += (size_t)snprintf(buf + len, n - len, "%s%s", len ? " " : "", chip_names[c]);
+	}
+	if (!buf[0])
+		snprintf(buf, n, "none");
+	return buf;
+}
+
+/* "SDA 1 SCL 1 RESET 1", or "not read" */
+static const char *pins_text(uint8_t p, char *buf, size_t n)
+{
+	if (p == TLC_PINS_NONE)
+		snprintf(buf, n, "not read");
+	else
+		snprintf(buf, n, "SDA %u SCL %u RESET %u", p & TLC_PIN_SDA ? 1 : 0,
+			 p & TLC_PIN_SCL ? 1 : 0, p & TLC_PIN_RESET ? 1 : 0);
+	return buf;
+}
+
+/* the I2C error flags as words: "no ack (AF)", "timeout", or "ack" for none */
+static const char *err_text(uint8_t e, char *buf, size_t n)
+{
+	static const char *const names[] = { "no ack (AF)", "arbitration lost (ARLO)",
+					     "bus error (BERR)", "timeout", "bus busy" };
+	size_t len = 0;
+
+	buf[0] = 0;
+	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]) && len < n; i++) {
+		if (e >> i & 1)
+			len += (size_t)snprintf(buf + len, n - len, "%s%s", len ? ", " : "", names[i]);
+	}
+	if (!buf[0])
+		snprintf(buf, n, "ack");
+	return buf;
+}
+
+/*
+ * The start line of STATUS: the chips that answered in each step of the
+ * init (probe, reset pulses, bus recovery), and the time it took.
+ */
+static void start_line(void)
+{
+	const struct tlc_start_info *s = tlc_start_info();
+	char a[24], b[24], c[24];
+
+	console_printf("start probe %s (%u rounds), reset %s (%u pulses), recovery %s, %lu ms%s%s\r\n",
+		       chip_list(s->probe, a, sizeof(a)), s->probe_rounds,
+		       s->reset_tries ? chip_list(s->reset, b, sizeof(b)) : "not needed", s->reset_tries,
+		       s->recovery_ran ? chip_list(s->recovery, c, sizeof(c)) : "not needed",
+		       (unsigned long)s->ms,
+		       s->stuck_after_reset ? ", SDA or SCL low after a reset pulse" : "",
+		       s->bus_free ? "" : ", bus not free at the end");
+}
+
+/* the pins line: power-up, idle at the init, after the first reset pulse, now */
+static void pins_line(void)
+{
+	const struct tlc_start_info *s = tlc_start_info();
+	uint8_t now = tlc_pins();
+	char a[24], b[24], c[24], d[24];
+
+	console_printf("pins power-up %s, idle %s, after reset %s, now %s%s%s\r\n",
+		       pins_text(s->pins_power, a, sizeof(a)), pins_text(s->pins_idle, b, sizeof(b)),
+		       pins_text(s->pins_reset, c, sizeof(c)), pins_text(now, d, sizeof(d)),
+		       now & TLC_PIN_SDA ? "" : ", SDA held low",
+		       now & TLC_PIN_SCL ? "" : ", SCL held low");
+}
+
+/*
+ * I2CSCAN [RESET]: probe each address 0x60..0x6F with START, address,
+ * STOP (no data, so 0x6B resets nothing). Then the I2C errors of each
+ * chip since the init, the registers of the chips that answer, and the
+ * pins. RESET: a reset pulse first, then the scan, then a new init of the
+ * chips (the pulse cleared their registers).
+ */
+static void cmd_i2cscan(int argc, char **argv)
+{
+	uint8_t res[16], regs[TLC_NREGS], pull;
+	char buf[96], buf2[24];
+	bool reset = argc > 1 && eq(argv[1], "RESET");
+	int len = 0;
+
+	if (argc > 1 && !reset) {
+		console_write("usage: I2CSCAN [RESET]\r\n");
+		return;
+	}
+	if (reset) {
+		tlc_reset_pulse();
+		console_printf("reset pulse: pins %s\r\n", pins_text(tlc_pins(), buf2, sizeof(buf2)));
+	}
+	for (int i = 0; i < 16; i++) {
+		res[i] = tlc_probe((uint8_t)(0x60 + i));
+		if (!res[i] && len < (int)sizeof(buf))
+			len += snprintf(buf + len, sizeof(buf) - (size_t)len, " 0x%02X", 0x60 + i);
+	}
+	console_printf("i2c scan 0x60..0x6F: ack%s\r\n", len ? buf : " none");
+	for (int c = 0; c < NCOLORS; c++)
+		console_printf("0x%02X %s: %s, chip %s\r\n", 0x60 + c, chip_names[c],
+			       err_text(res[c], buf, sizeof(buf)), tlc_state_name(c));
+	console_printf("0x68 all-call: %s. Only a chip before its init or after a reset answers here\r\n",
+		       err_text(res[TLC_ADDR_ALLCALL - 0x60], buf, sizeof(buf)));
+	console_printf("0x6B software reset: %s. Every chip answers here\r\n",
+		       err_text(res[TLC_ADDR_SWRST - 0x60], buf, sizeof(buf)));
+	len = 0;
+	for (int i = NCOLORS; i < 16; i++) {
+		if (!res[i] && i != TLC_ADDR_ALLCALL - 0x60 && i != TLC_ADDR_SWRST - 0x60 &&
+		    len < (int)sizeof(buf))
+			len += snprintf(buf + len, sizeof(buf) - (size_t)len, " 0x%02X", 0x60 + i);
+	}
+	if (len)
+		console_printf("other ack:%s. No chip has this address: check the address pins\r\n", buf);
+	for (int c = 0; c < NCOLORS; c++) {
+		const struct tlc_chip_info *i = tlc_chip_info(c);
+
+		console_printf("%s errors af %u arlo %u berr %u timeout %u busy %u, last %s\r\n",
+			       chip_names[c], i->af, i->arlo, i->berr, i->timeout, i->busy,
+			       i->last_err ? err_text(i->last_err, buf, sizeof(buf)) : "none");
+	}
+	for (int c = 0; c < NCOLORS; c++) {
+		if (res[c])
+			continue;
+		if (tlc_read_all(c, regs))
+			console_printf("%s mode %02X %02X iref %02X eflag %02X %02X\r\n", chip_names[c],
+				       regs[0], regs[1], regs[TLC_REG_IREF], regs[TLC_REG_EFLAG1],
+				       regs[TLC_REG_EFLAG1 + 1]);
+		else
+			console_printf("%s register read failed\r\n", chip_names[c]);
+	}
+	start_line();
+	pins_line();
+	pull = tlc_pullups();
+	console_printf("pull-up test: SDA %s, SCL %s\r\n",
+		       pull & TLC_PIN_SDA ? "rises" : "stays low (no pull-up)",
+		       pull & TLC_PIN_SCL ? "rises" : "stays low (no pull-up)");
+	if (reset) {
+		tlc_init();
+		leds_resync();
+		console_printf("init again: chips %s %s %s\r\n", tlc_state_name(RED),
+			       tlc_state_name(GREEN), tlc_state_name(BLUE));
+	}
+}
+
 static void cmd_status(void)
 {
 	const struct led_state *s = leds_state();
@@ -264,11 +416,12 @@ static void cmd_status(void)
 	console_printf("leds %s%s (LED GET shows each LED)\r\n", s->pattern_on ? "pattern" : "host",
 		       s->limited ? " limit" : "");
 	console_printf("chips %s %s %s uptime %lu ms start %lu fails %lu reset flags 0x%08lX errors %d\r\n",
-		       tlc_ready(RED) ? "ok" : "BAD", tlc_ready(GREEN) ? "ok" : "BAD",
-		       tlc_ready(BLUE) ? "ok" : "BAD", (unsigned long)millis(),
-		       (unsigned long)guard_start_count(), (unsigned long)guard_fails(),
-		       (unsigned long)guard_reset_flags(), errlog_count());
+		       tlc_state_name(RED), tlc_state_name(GREEN), tlc_state_name(BLUE),
+		       (unsigned long)millis(), (unsigned long)guard_start_count(),
+		       (unsigned long)guard_fails(), (unsigned long)guard_reset_flags(), errlog_count());
 	ledmap_line();
+	start_line();
+	pins_line();
 }
 
 /*
@@ -318,7 +471,7 @@ static void cmd_tlc(int argc, char **argv)
 static void cmd_tlcregs(const char *arg)
 {
 	int c = arg ? color_arg(arg) : -1;
-	uint8_t r[0x18];
+	uint8_t r[TLC_NREGS];
 
 	if (c < 0) {
 		console_write("usage: TLCREGS COLOR\r\n");
@@ -328,7 +481,7 @@ static void cmd_tlcregs(const char *arg)
 		console_write("LED driver not initialized!\r\n");
 		return;
 	}
-	if (!tlc_read(c, 0, r, sizeof(r))) {
+	if (!tlc_read_all(c, r)) {
 		console_write("TLCREGS failed\r\n");
 		return;
 	}
@@ -338,6 +491,8 @@ static void cmd_tlcregs(const char *arg)
 	console_printf("%s pwm %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u\r\n", color_names[c],
 		       r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9],
 		       r[10], r[11], r[12], r[13], r[14], r[15], r[16], r[17]);
+	console_printf("%s iref %02X eflag %02X %02X\r\n", color_names[c], r[TLC_REG_IREF],
+		       r[TLC_REG_EFLAG1], r[TLC_REG_EFLAG1 + 1]);
 }
 
 static void cmd_selftest(int argc, char **argv)
@@ -370,7 +525,12 @@ static void cmd_selftest(int argc, char **argv)
 		rgb[0] = rgb[1] = rgb[2] = (uint8_t)v;
 	}
 	leds_direct(rgb);
-	console_printf("selftest on %u %u %u\r\n", rgb[0], rgb[1], rgb[2]);
+	console_printf("selftest on %u %u %u", rgb[0], rgb[1], rgb[2]);
+	for (int c = 0; c < NCOLORS; c++) {
+		if (rgb[c] && !tlc_ready(c))
+			console_printf(", %s chip %s", chip_names[c], tlc_state_name(c));
+	}
+	console_write("\r\n");
 }
 
 static void led_get(int first, int last)
@@ -380,8 +540,12 @@ static void led_get(int first, int last)
 
 	for (int c = 0; c < NCOLORS; c++)
 		tlc_get_dim(c, &pwm, &grp[c]);
-	console_printf("leds %s fx %s grp %u %u %u%s\r\n", s->pattern_on ? "pattern" : "host",
+	console_printf("leds %s fx %s grp %u %u %u%s", s->pattern_on ? "pattern" : "host",
 		       leds_fx_name(), grp[0], grp[1], grp[2], s->limited ? " limit" : "");
+	if (!tlc_ready(RED) || !tlc_ready(GREEN) || !tlc_ready(BLUE))
+		console_printf(" chips %s %s %s", tlc_state_name(RED), tlc_state_name(GREEN),
+			       tlc_state_name(BLUE));
+	console_write("\r\n");
 	for (int i = first; i <= last; i++) {
 		int o = leds_output(i);
 		uint8_t lvl[NCOLORS];
@@ -531,13 +695,23 @@ static void cmd_fx(int argc, char **argv)
  * SOF packets) with no configuration. CONFIG: USB configured. FAULT: a
  * hard fault. RESET: a reset that the firmware did not plan, as the
  * watchdog gives (QEMU has no watchdog model). For the console: RX gives
- * three lines to console_rx in one call, as one USB packet does.
+ * three lines to console_rx in one call, as one USB packet does. CHIPS
+ * MASK: only the chips of MASK answer (bit 0 red, 1 green, 2 blue), then
+ * the chips start again as at TLCRESET.
  */
-static void cmd_test(const char *what)
+static void cmd_test(const char *what, const char *arg)
 {
 	static const char three[] = "VER\r\nUPTIME\r\nCAPS\r\n";
+	long v;
 
-	if (eq(what, "RX")) {
+	if (eq(what, "CHIPS") && num_arg(arg, 0, 7, &v)) {
+		tlc_qemu_chips((uint8_t)v);
+		tlc_init();
+		leds_resync();
+		console_printf("test chips %s %s %s\r\n", tlc_state_name(RED), tlc_state_name(GREEN),
+			       tlc_state_name(BLUE));
+		return;
+	} else if (eq(what, "RX")) {
 		console_rx((const uint8_t *)three, sizeof(three) - 1);
 	} else if (eq(what, "HOST")) {
 		guard_usb_host();
@@ -548,7 +722,7 @@ static void cmd_test(const char *what)
 	} else if (eq(what, "RESET")) {
 		system_reset();
 	} else {
-		console_write("usage: TEST HOST|CONFIG|FAULT|RESET|RX\r\n");
+		console_write("usage: TEST HOST|CONFIG|FAULT|RESET|RX|CHIPS MASK\r\n");
 		return;
 	}
 	console_printf("test %s\r\n", what);
@@ -580,7 +754,7 @@ static void run_line(void)
 	if (eq(argv[0], "VER") || eq(argv[0], "VERSION")) {
 		console_write(TSX_FW_NAME "\r\n");
 	} else if (eq(argv[0], "CAPS")) {
-		console_write("tsx-ledbar fade blink breathe rainbow smooth cap status leds16 chase fill spectrum split ledmap\r\n");
+		console_write("tsx-ledbar fade blink breathe rainbow smooth cap status leds16 chase fill spectrum split ledmap i2cscan\r\n");
 	} else if (eq(argv[0], "HELP") || eq(argv[0], "?")) {
 		cmd_help();
 	} else if (eq(argv[0], "STATUS")) {
@@ -608,6 +782,8 @@ static void run_line(void)
 	} else if (eq(argv[0], "TLCRESET")) {
 		console_printf("TLC reset %s\r\n", tlc_init() ? "ok" : "FAILED");
 		leds_resync();
+	} else if (eq(argv[0], "I2CSCAN")) {
+		cmd_i2cscan(argc, argv);
 	} else if (eq(argv[0], "TLCREGS")) {
 		cmd_tlcregs(argc > 1 ? argv[1] : NULL);
 	} else if (eq(argv[0], "TLCOUTMODE") || eq(argv[0], "TLCGROUPMODE") ||
@@ -638,7 +814,7 @@ static void run_line(void)
 		console_printf("trace %s\r\n", leds_trace_regs ? "regs" : leds_trace_pix ? "pix" :
 			       leds_trace ? "on" : "off");
 	} else if (eq(argv[0], "TEST")) {
-		cmd_test(argc > 1 ? argv[1] : NULL);
+		cmd_test(argc > 1 ? argv[1] : NULL, argc > 2 ? argv[2] : NULL);
 #endif
 	} else {
 		console_printf("unknown command: %s (HELP for a list)\r\n", argv[0]);

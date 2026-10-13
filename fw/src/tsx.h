@@ -45,13 +45,14 @@ uint32_t guard_start_count(void);	/* this start since power-on */
 uint32_t guard_fails(void);		/* failed starts in a row */
 
 /* errlog.c */
-#define ERR_TLC_INIT		119	/* LED driver chip did not answer */
+#define ERR_TLC_INIT		119	/* LED driver chip did not start. cause: chip | I2C error flags << 8 */
 #define ERR_I2C			120
 #define ERR_WATCHDOG		121	/* the last start ended in a reset that was not planned */
 #define ERR_GUARD		122	/* cause: failed starts in a row */
 #define ERR_USB			123	/* cause: the IN endpoint that was stuck */
 #define ERR_FAULT		124	/* the last start ended in a hard fault */
 #define ERR_NOCONFIG		125	/* the last start: a host ran, no USB configuration */
+#define ERR_TLC_START		126	/* not all LED driver chips started: what each step found */
 void errlog_add(uint16_t subsystem, uint16_t cause);
 int errlog_count(void);
 void errlog_clear(void);
@@ -59,8 +60,52 @@ void errlog_clear(void);
 void errlog_each(void (*fn)(int, uint32_t, uint16_t, uint16_t));
 
 /* i2c_tlc.c: the three TLC59116 drivers, one per color */
-bool tlc_init(void);			/* reset pulse and register init, all chips */
+bool tlc_init(void);			/* probe, reset pulses, bus recovery: see i2c_tlc.c */
 bool tlc_ready(int color);
+/* I2C error flags of a failed transfer */
+#define TLC_E_AF		0x01	/* no ACK */
+#define TLC_E_ARLO		0x02	/* arbitration lost */
+#define TLC_E_BERR		0x04	/* bus error */
+#define TLC_E_TIMEOUT		0x08	/* no flag within the time limit */
+#define TLC_E_BUSY		0x10	/* the bus stayed busy before the START */
+/* pin levels: bit set = high */
+#define TLC_PIN_SDA		0x01
+#define TLC_PIN_SCL		0x02
+#define TLC_PIN_RESET		0x04
+#define TLC_PINS_ALL		0x07
+#define TLC_PINS_NONE		0xFF	/* not read */
+#define TLC_ADDR_ALLCALL	0x68
+#define TLC_ADDR_SWRST		0x6B
+#define TLC_NREGS		0x1F	/* registers 0x00..0x1E, EFLAG2 is the last */
+#define TLC_REG_IREF		0x1C
+#define TLC_REG_EFLAG1		0x1D
+enum { TLC_PHASE_NONE, TLC_PHASE_PROBE, TLC_PHASE_RESET, TLC_PHASE_RECOVERY };
+struct tlc_chip_info {
+	uint8_t phase;			/* the start step that made the chip ready */
+	uint8_t last_err;		/* TLC_E flags of the last failed transfer */
+	uint16_t af, arlo, berr, timeout, busy;	/* failed transfers since the init, by flag */
+};
+struct tlc_start_info {
+	uint8_t pins_power;		/* at the first init, before RESET is driven */
+	uint8_t pins_idle;		/* at the init, before the probe */
+	uint8_t pins_reset;		/* after the first reset pulse, or TLC_PINS_NONE */
+	uint8_t probe, reset, recovery;	/* bit c: chip c answered in that step */
+	uint8_t probe_rounds, reset_tries;
+	bool recovery_ran;
+	bool stuck_after_reset;		/* SDA or SCL low after a reset pulse */
+	bool bus_free;			/* SDA and SCL high at the end of the init */
+	uint32_t ms;			/* time of the init */
+};
+const struct tlc_chip_info *tlc_chip_info(int color);
+const struct tlc_start_info *tlc_start_info(void);
+const char *tlc_state_name(int color);	/* "ok", "BAD(nack)" or "BAD(bus)" */
+uint8_t tlc_probe(uint8_t addr);	/* I2CSCAN: 0 = ACK, else TLC_E flags */
+uint8_t tlc_pins(void);			/* SDA, SCL and RESET now: TLC_PIN bits */
+uint8_t tlc_pullups(void);		/* TLC_PIN bit set: the line has a pull-up */
+bool tlc_read_all(int color, uint8_t regs[TLC_NREGS]);	/* from the chip */
+#ifdef TSX_QEMU
+void tlc_qemu_chips(uint8_t mask);	/* TEST CHIPS: bit c = chip c answers */
+#endif
 bool tlc_write(int color, uint8_t reg, const uint8_t *data, size_t n);
 bool tlc_read(int color, uint8_t reg, uint8_t *data, size_t n);
 bool tlc_set_group_pwm(int color, uint8_t duty);

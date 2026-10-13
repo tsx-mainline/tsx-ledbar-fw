@@ -91,7 +91,7 @@ chips, and the values 2 to 7 are `TS-ROOM` boards.
 
 ### Read the map
 
-The last line of `STATUS` shows the value and the map, for example:
+The `variant` line of `STATUS` shows the value and the map, for example:
 
 ```
 variant 1 map TSW-1060-LB panel
@@ -311,7 +311,9 @@ GRPPWM changes the engine wrote since the start.
 | `FX STEP MS` | move the clock of the effect forward by MS, also while it is stopped |
 
 The first line of `LED GET` shows the base (`host` or `pattern`), the
-effect and the GRPPWM value of each chip. `STATUS` shows the base in the
+effect and the GRPPWM value of each chip. When a chip is not in use, the
+line ends with the state of the three chips, for example
+`chips ok BAD(nack) ok`. `STATUS` shows the base in the
 line `leds host` or `leds pattern`. In `STATUS`, `duty` is the highest LED
 duty of each color. `cap` in `STATUS` is the `FX CAP` value of both
 limits.

@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * The three TLC59116 LED drivers: red at 0x60, green at 0x61, blue at
- * 0x62 on I2C1 (PB6 SCL, PB7 SDA, 100 kHz). PB12 is their reset line.
+ * 0x62 on I2C1 (PB6 SCL, PB7 SDA, 100 kHz). PB12 is their shared reset
+ * line.
  *
  * The driver is a small polled I2C master with timeouts, so a stuck bus
  * cannot hang the firmware. A bus recovery (up to 18 SCL clocks while
- * SDA is low) runs before the init and after an error.
+ * SDA is low, then a STOP) runs before the init and after each failed
+ * transfer. Each failed transfer of a chip adds to the error counters of
+ * that chip (AF, ARLO, BERR, timeout, busy bus).
  *
  * Init writes registers 0x00..0x17 in one auto-increment transfer:
- * MODE1 = 0x80 (auto-increment on, oscillator on), MODE2 = 0, PWM0..15
- * = 0xFF, GRPPWM = 0, GRPFREQ = 0, LEDOUT0..3 = 0xFF (every output in
- * mode 3: PWM and group control).
+ * MODE1 = 0x80 (auto-increment on, oscillator on, all-call address off),
+ * MODE2 = 0, PWM0..15 = 0xFF, GRPPWM = 0, GRPFREQ = 0, LEDOUT0..3 = 0xFF
+ * (every output in mode 3: PWM and group control).
  *
  * In mode 3 an output is on for PWMx/256 of the 97 kHz individual period
  * and only inside the GRPPWM/256 window of the 190 Hz group period, so
@@ -24,6 +27,7 @@
  * (see leds.c).
  *
  * The QEMU build has no I2C model: the chip registers are kept in RAM.
+ * The console command TEST CHIPS sets which chips answer.
  */
 #include "tsx.h"
 
@@ -35,14 +39,40 @@
 #define REG_GRPPWM	TLC_REG_GRPPWM
 #define REG_GRPFREQ	0x13
 #define REG_LEDOUT0	0x14
+#define REG_LAST	0x1E	/* EFLAG2: the last register of the chip */
 #define MODE2_DMBLNK	0x20
 
+#define ALL_CHIPS	((1 << NCOLORS) - 1)
+#define PROBE_ROUNDS	5
 #define INIT_TRIES	5
+#define RECOVERY_ROUNDS	2
 #define INIT_WAIT_MS	50
 #define I2C_TIMEOUT_MS	5
+#define PINS_BUS	(TLC_PIN_SDA | TLC_PIN_SCL)
 
 static bool ready[NCOLORS];
 static uint8_t shadow[NCOLORS][0x18];
+static struct tlc_chip_info info[NCOLORS];
+static struct tlc_start_info start_info = { .pins_power = TLC_PINS_NONE,
+					    .pins_reset = TLC_PINS_NONE };
+
+/* a failed transfer of chip color with the TLC_E flags err */
+static void note_err(int color, uint8_t err)
+{
+	struct tlc_chip_info *i = &info[color];
+
+	i->last_err = err;
+	if (err & TLC_E_AF)
+		i->af++;
+	if (err & TLC_E_ARLO)
+		i->arlo++;
+	if (err & TLC_E_BERR)
+		i->berr++;
+	if (err & TLC_E_TIMEOUT)
+		i->timeout++;
+	if (err & TLC_E_BUSY)
+		i->busy++;
+}
 
 #ifndef TSX_QEMU
 
@@ -55,13 +85,34 @@ static uint8_t shadow[NCOLORS][0x18];
 #define SDA_PIN		GPIO7
 #define RESET_PIN	GPIO12
 
+#define ADDR_ERRORS	(I2C_SR1_AF | I2C_SR1_ARLO | I2C_SR1_BERR)
+
+static uint8_t i2c_err;	/* TLC_E flags of the last failed transfer */
+
+/* the error flags in SR1, or a timeout when none is set */
+static uint8_t sr1_err(void)
+{
+	uint32_t sr1 = I2C_SR1(I2C);
+	uint8_t e = 0;
+
+	if (sr1 & I2C_SR1_AF)
+		e |= TLC_E_AF;
+	if (sr1 & I2C_SR1_ARLO)
+		e |= TLC_E_ARLO;
+	if (sr1 & I2C_SR1_BERR)
+		e |= TLC_E_BERR;
+	return e ? e : TLC_E_TIMEOUT;
+}
+
 static bool wait_flag(volatile uint32_t *reg, uint32_t mask, bool set)
 {
 	uint32_t start = millis();
 
 	while (((*reg & mask) != 0) != set) {
-		if (millis() - start > I2C_TIMEOUT_MS)
+		if (millis() - start > I2C_TIMEOUT_MS) {
+			i2c_err = sr1_err();
 			return false;
+		}
 	}
 	return true;
 }
@@ -79,12 +130,37 @@ static void short_wait(void)
 		;
 }
 
-/* clock SCL until SDA is released, then a STOP condition */
-static void bus_recover(void)
+/*
+ * The levels of SDA, SCL and RESET. SDA and SCL are read as GPIO inputs
+ * with the pull-ups of the bus, so the level is what the chips do, not
+ * what the I2C peripheral drives. RESET is read as it is: an output
+ * high after the start, so a 0 means that the line is shorted to ground.
+ */
+static uint8_t pins_read(void)
 {
+	uint16_t v;
+
+	gpio_mode_setup(GPIOB, GPIO_MODE_INPUT, GPIO_PUPD_PULLUP, SCL_PIN | SDA_PIN);
+	short_wait();
+	v = gpio_get(GPIOB, SCL_PIN | SDA_PIN | RESET_PIN);
+	i2c_pins_af();
+	return (uint8_t)((v & SDA_PIN ? TLC_PIN_SDA : 0) | (v & SCL_PIN ? TLC_PIN_SCL : 0) |
+			 (v & RESET_PIN ? TLC_PIN_RESET : 0));
+}
+
+/*
+ * Clock SCL until SDA is released, then a STOP condition. True when SDA
+ * and SCL are both high at the end. Clocks cannot free a bus with SCL
+ * held low.
+ */
+static bool bus_recover(void)
+{
+	bool ok;
+
 	gpio_set(GPIOB, SCL_PIN | SDA_PIN);
 	gpio_set_output_options(GPIOB, GPIO_OTYPE_OD, GPIO_OSPEED_2MHZ, SCL_PIN | SDA_PIN);
 	gpio_mode_setup(GPIOB, GPIO_MODE_OUTPUT, GPIO_PUPD_PULLUP, SCL_PIN | SDA_PIN);
+	short_wait();
 	for (int i = 0; i < 18 && !gpio_get(GPIOB, SDA_PIN); i++) {
 		gpio_clear(GPIOB, SCL_PIN);
 		short_wait();
@@ -98,7 +174,9 @@ static void bus_recover(void)
 	short_wait();
 	gpio_set(GPIOB, SDA_PIN);
 	short_wait();
+	ok = gpio_get(GPIOB, SDA_PIN | SCL_PIN) == (SDA_PIN | SCL_PIN);
 	i2c_pins_af();
+	return ok;
 }
 
 static void i2c_setup(void)
@@ -110,25 +188,26 @@ static void i2c_setup(void)
 	i2c_peripheral_enable(I2C);
 }
 
-static void i2c_fail(void)
+/* reset the peripheral and free the bus: true when SDA and SCL are high */
+static bool i2c_fail(void)
 {
-	/* reset the peripheral, free the bus */
+	bool ok;
+
 	i2c_peripheral_disable(I2C);
 	I2C_CR1(I2C) |= I2C_CR1_SWRST;
 	I2C_CR1(I2C) &= ~I2C_CR1_SWRST;
-	bus_recover();
+	ok = bus_recover();
 	i2c_setup();
+	return ok;
 }
-
-#define ADDR_ERRORS	(I2C_SR1_AF | I2C_SR1_ARLO | I2C_SR1_BERR)
 
 /*
  * START and the address. The address phase ends with ADDR (ACK), AF (no
  * ACK: chip absent or not ready), ARLO (arbitration lost: the peripheral
  * drops to slave mode and sets neither ADDR nor AF) or BERR (a bus error).
  * A glitch can also give none of them, so the wait has the same time
- * limit as the other phases. On a failure the caller runs i2c_fail (bus
- * recovery) and tlc_write adds an ERRLOG entry.
+ * limit as the other phases. On a failure i2c_err holds the flags, and
+ * the caller runs i2c_fail (bus recovery).
  */
 static bool i2c_start_addr(uint8_t addr, bool read)
 {
@@ -141,6 +220,7 @@ static bool i2c_start_addr(uint8_t addr, bool read)
 	start = millis();
 	while (!((sr1 = I2C_SR1(I2C)) & I2C_SR1_ADDR)) {
 		if ((sr1 & ADDR_ERRORS) || millis() - start > I2C_TIMEOUT_MS) {
+			i2c_err = sr1_err();
 			I2C_SR1(I2C) &= ~ADDR_ERRORS;
 			i2c_send_stop(I2C);
 			return false;
@@ -150,11 +230,19 @@ static bool i2c_start_addr(uint8_t addr, bool read)
 	return true;
 }
 
+/* a bus that stays busy (SDA or SCL low, or no STOP seen) */
+static bool i2c_idle(void)
+{
+	i2c_err = 0;
+	if (wait_flag(&I2C_SR2(I2C), I2C_SR2_BUSY, false))
+		return true;
+	i2c_err = TLC_E_BUSY;
+	return false;
+}
+
 static bool i2c_write_bytes(uint8_t addr, const uint8_t *data, size_t n)
 {
-	if (!wait_flag(&I2C_SR2(I2C), I2C_SR2_BUSY, false))
-		return false;
-	if (!i2c_start_addr(addr, false))
+	if (!i2c_idle() || !i2c_start_addr(addr, false))
 		return false;
 	for (size_t i = 0; i < n; i++) {
 		if (!wait_flag(&I2C_SR1(I2C), I2C_SR1_TxE, true))
@@ -169,9 +257,7 @@ static bool i2c_write_bytes(uint8_t addr, const uint8_t *data, size_t n)
 
 static bool i2c_read_reg(uint8_t addr, uint8_t reg, uint8_t *data, size_t n)
 {
-	if (!wait_flag(&I2C_SR2(I2C), I2C_SR2_BUSY, false))
-		return false;
-	if (!i2c_start_addr(addr, false))
+	if (!i2c_idle() || !i2c_start_addr(addr, false))
 		return false;
 	if (!wait_flag(&I2C_SR1(I2C), I2C_SR1_TxE, true))
 		return false;
@@ -194,6 +280,11 @@ static bool i2c_read_reg(uint8_t addr, uint8_t reg, uint8_t *data, size_t n)
 	return true;
 }
 
+/*
+ * Once, at the first init: read the pins as they are after the power-up
+ * (RESET still an input), then drive RESET high, free the bus and start
+ * the peripheral.
+ */
 static void hw_init(void)
 {
 	static bool done;
@@ -201,6 +292,7 @@ static void hw_init(void)
 	if (done)
 		return;
 	done = true;
+	start_info.pins_power = pins_read();
 	gpio_mode_setup(GPIOB, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, RESET_PIN);
 	gpio_set(GPIOB, RESET_PIN);
 	i2c_pins_af();
@@ -208,13 +300,17 @@ static void hw_init(void)
 	i2c_setup();
 }
 
-void tlc_reset_pulse(void)
+static void reset_pulse(void)
 {
-	hw_init();
 	gpio_clear(GPIOB, RESET_PIN);
 	delay_ms(5);
 	gpio_set(GPIOB, RESET_PIN);
 	delay_ms(5);
+}
+
+static bool bus_reinit(void)
+{
+	return i2c_fail();
 }
 
 static bool raw_write(int color, uint8_t reg, const uint8_t *data, size_t n)
@@ -227,6 +323,7 @@ static bool raw_write(int color, uint8_t reg, const uint8_t *data, size_t n)
 	for (size_t i = 0; i < n; i++)
 		buf[1 + i] = data[i];
 	if (!i2c_write_bytes(TLC_ADDR(color), buf, n + 1)) {
+		note_err(color, i2c_err);
 		i2c_fail();
 		return false;
 	}
@@ -236,36 +333,146 @@ static bool raw_write(int color, uint8_t reg, const uint8_t *data, size_t n)
 static bool raw_read(int color, uint8_t reg, uint8_t *data, size_t n)
 {
 	if (!i2c_read_reg(TLC_ADDR(color), reg | TLC_AUTOINC, data, n)) {
+		note_err(color, i2c_err);
 		i2c_fail();
 		return false;
 	}
 	return true;
 }
 
+/*
+ * I2CSCAN: START, the address with the write bit, STOP. No data, so the
+ * software reset address 0x6B only answers and resets nothing.
+ */
+uint8_t tlc_probe(uint8_t addr)
+{
+	uint8_t err;
+
+	hw_init();
+	if (!i2c_idle() || !i2c_start_addr(addr, false)) {
+		err = i2c_err;
+		i2c_fail();
+		return err;
+	}
+	i2c_send_stop(I2C);
+	return 0;
+}
+
+uint8_t tlc_pins(void)
+{
+	hw_init();
+	return pins_read();
+}
+
+/*
+ * The pull-up test of I2CSCAN: drive a line low, release it with no
+ * internal pull-up, and read it after a short wait. A line with a
+ * pull-up resistor is high again. A line with no resistor (for example a
+ * broken trace to the resistor) stays low. SDA is tested while SCL is
+ * low, so the chips see no START or STOP. The peripheral starts again
+ * afterwards, because it saw the lines move.
+ */
+uint8_t tlc_pullups(void)
+{
+	uint8_t r = 0;
+
+	hw_init();
+	gpio_set(GPIOB, SCL_PIN | SDA_PIN);
+	gpio_set_output_options(GPIOB, GPIO_OTYPE_OD, GPIO_OSPEED_2MHZ, SCL_PIN | SDA_PIN);
+	gpio_mode_setup(GPIOB, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, SCL_PIN | SDA_PIN);
+	gpio_clear(GPIOB, SCL_PIN);
+	short_wait();
+	gpio_mode_setup(GPIOB, GPIO_MODE_INPUT, GPIO_PUPD_NONE, SCL_PIN);
+	short_wait();
+	if (gpio_get(GPIOB, SCL_PIN))
+		r |= TLC_PIN_SCL;
+	gpio_mode_setup(GPIOB, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, SCL_PIN);	/* SCL low */
+	gpio_clear(GPIOB, SDA_PIN);
+	short_wait();
+	gpio_mode_setup(GPIOB, GPIO_MODE_INPUT, GPIO_PUPD_NONE, SDA_PIN);
+	short_wait();
+	if (gpio_get(GPIOB, SDA_PIN))
+		r |= TLC_PIN_SDA;
+	gpio_set(GPIOB, SDA_PIN);
+	gpio_mode_setup(GPIOB, GPIO_MODE_OUTPUT, GPIO_PUPD_PULLUP, SDA_PIN);
+	short_wait();
+	gpio_set(GPIOB, SCL_PIN);
+	short_wait();
+	i2c_fail();
+	return r;
+}
+
 #else /* TSX_QEMU */
 
-void tlc_reset_pulse(void)
+/* the chips that answer: TEST CHIPS sets them */
+static uint8_t qemu_chips = ALL_CHIPS;
+
+void tlc_qemu_chips(uint8_t mask)
 {
+	qemu_chips = mask & ALL_CHIPS;
 }
 
 static void hw_init(void)
 {
+	start_info.pins_power = TLC_PINS_ALL;
+}
+
+static void reset_pulse(void)
+{
+}
+
+static bool bus_reinit(void)
+{
+	return true;
 }
 
 static bool raw_write(int color, uint8_t reg, const uint8_t *data, size_t n)
 {
-	(void)color; (void)reg; (void)data; (void)n;
+	(void)reg; (void)data; (void)n;
+	if (!(qemu_chips >> color & 1)) {
+		note_err(color, TLC_E_AF);
+		return false;
+	}
 	return true;
 }
 
 static bool raw_read(int color, uint8_t reg, uint8_t *data, size_t n)
 {
-	for (size_t i = 0; i < n && reg + i < sizeof(shadow[0]); i++)
-		data[i] = shadow[color][reg + i];
+	if (!(qemu_chips >> color & 1)) {
+		note_err(color, TLC_E_AF);
+		return false;
+	}
+	for (size_t i = 0; i < n; i++)
+		data[i] = reg + i < sizeof(shadow[0]) ? shadow[color][reg + i] : 0;
 	return true;
 }
 
+uint8_t tlc_probe(uint8_t addr)
+{
+	if (addr >= 0x60 && addr < 0x60 + NCOLORS && (qemu_chips >> (addr - 0x60) & 1))
+		return 0;
+	if (addr == TLC_ADDR_SWRST && qemu_chips)
+		return 0;
+	return TLC_E_AF;
+}
+
+uint8_t tlc_pins(void)
+{
+	return TLC_PINS_ALL;
+}
+
+uint8_t tlc_pullups(void)
+{
+	return TLC_PIN_SDA | TLC_PIN_SCL;
+}
+
 #endif
+
+void tlc_reset_pulse(void)
+{
+	hw_init();
+	reset_pulse();
+}
 
 bool tlc_write(int color, uint8_t reg, const uint8_t *data, size_t n)
 {
@@ -287,6 +494,14 @@ bool tlc_read(int color, uint8_t reg, uint8_t *data, size_t n)
 	return raw_read(color, reg, data, n);
 }
 
+/* all registers, 0x00..0x1E: the diagnosis registers too (IREF, EFLAG) */
+bool tlc_read_all(int color, uint8_t regs[TLC_NREGS])
+{
+	if (color < 0 || color >= NCOLORS)
+		return false;
+	return raw_read(color, 0, regs, TLC_NREGS);
+}
+
 static bool chip_init(int color)
 {
 	uint8_t regs[0x18];
@@ -306,41 +521,149 @@ static bool chip_init(int color)
 	return true;
 }
 
+/* init the chips that are not in have: the chips that answered, with have */
+static uint8_t init_missing(uint8_t have)
+{
+	for (int c = 0; c < NCOLORS; c++) {
+		if (!(have >> c & 1) && chip_init(c))
+			have |= (uint8_t)(1 << c);
+	}
+	return have;
+}
+
+static void set_phase(uint8_t mask, uint8_t phase)
+{
+	for (int c = 0; c < NCOLORS; c++) {
+		if ((mask >> c & 1) && info[c].phase == TLC_PHASE_NONE)
+			info[c].phase = phase;
+	}
+}
+
 /*
- * Reset the chips and write their registers. The stock firmware probes
- * them once, 42 ms after power-up, and gives up ("LED driver not
- * initialized!") when the supply is not ready yet. This init waits and
- * retries, with a new reset pulse between the tries.
+ * Start the chips, in three steps. Each chip that answers stays in use,
+ * also when another chip does not answer.
+ *
+ * 1. Probe: write the registers with no reset pulse, as the stock
+ *    firmware does. When some chips answer, the supply is up: ask the
+ *    others again, still with no pulse, up to PROBE_ROUNDS times.
+ * 2. Reset: when a chip is still missing, pulse the shared reset line and
+ *    init all chips again, up to INIT_TRIES times. A pulse resets every
+ *    chip, so every chip needs its registers again. A driver supply that
+ *    comes up late at power-up gives no answer to the probe, and the
+ *    pulses with their wait give it time. The steps stop early when SDA
+ *    or SCL stays low after a pulse, or when a pulse costs a chip that
+ *    answered before.
+ * 3. Recovery: when a chip is still missing, free the bus (SCL clocks and
+ *    a STOP) and init the missing chips again with no pulse.
  */
 bool tlc_init(void)
 {
-	bool all = true;
+	struct tlc_start_info *s = &start_info;
+	uint32_t t0;
+	uint8_t have, before, pins;
 
 	hw_init();
-	for (int c = 0; c < NCOLORS; c++)
-		ready[c] = false;
-	for (int t = 0; t < INIT_TRIES; t++) {
-		tlc_reset_pulse();
-		delay_ms(INIT_WAIT_MS);
-		all = true;
-		for (int c = 0; c < NCOLORS; c++) {
-			if (!ready[c])
-				ready[c] = chip_init(c);
-			all = all && ready[c];
-		}
-		if (all)
-			return true;
-	}
+	t0 = millis();
 	for (int c = 0; c < NCOLORS; c++) {
-		if (!ready[c])
-			errlog_add(ERR_TLC_INIT, (uint16_t)c);
+		ready[c] = false;
+		info[c] = (struct tlc_chip_info){ 0 };
 	}
-	return all;
+	s->pins_idle = tlc_pins();
+	s->pins_reset = TLC_PINS_NONE;
+	s->probe = s->reset = s->recovery = 0;
+	s->probe_rounds = s->reset_tries = 0;
+	s->recovery_ran = s->stuck_after_reset = s->bus_free = false;
+
+	/* 1. probe */
+	have = 0;
+	do {
+		if (s->probe_rounds)
+			delay_ms(INIT_WAIT_MS);
+		have = init_missing(have);
+		s->probe_rounds++;
+	} while (have && have != ALL_CHIPS && s->probe_rounds < PROBE_ROUNDS);
+	s->probe = have;
+	set_phase(have, TLC_PHASE_PROBE);
+
+	/* 2. reset pulses */
+	before = have;
+	while (have != ALL_CHIPS && s->reset_tries < INIT_TRIES) {
+		reset_pulse();
+		delay_ms(INIT_WAIT_MS);
+		pins = tlc_pins();
+		if (!s->reset_tries)
+			s->pins_reset = pins;
+		s->reset_tries++;
+		if ((pins & PINS_BUS) != PINS_BUS) {
+			s->stuck_after_reset = true;
+			have = 0;
+			break;
+		}
+		have = init_missing(0);
+		s->reset = have;
+		if ((have & before) != before)
+			break;
+	}
+	if (s->reset_tries)
+		set_phase(have, TLC_PHASE_RESET);
+
+	/* 3. recovery */
+	for (int r = 0; have != ALL_CHIPS && r < RECOVERY_ROUNDS; r++) {
+		uint8_t now;
+
+		if (r)
+			delay_ms(INIT_WAIT_MS);
+		s->recovery_ran = true;
+		bus_reinit();
+		now = init_missing(have);
+		s->recovery |= (uint8_t)(now & ~have);
+		have = now;
+	}
+	set_phase(s->recovery, TLC_PHASE_RECOVERY);
+
+	s->bus_free = (tlc_pins() & PINS_BUS) == PINS_BUS;
+	s->ms = millis() - t0;
+	for (int c = 0; c < NCOLORS; c++) {
+		ready[c] = have >> c & 1;
+		if (!ready[c])
+			errlog_add(ERR_TLC_INIT, (uint16_t)(info[c].last_err << 8 | c));
+	}
+	if (have != ALL_CHIPS)
+		errlog_add(ERR_TLC_START, (uint16_t)(s->probe | s->reset << 4 | s->recovery << 8 |
+						     (s->stuck_after_reset ? 0x1000 : 0) |
+						     (s->bus_free ? 0 : 0x2000)));
+	return have == ALL_CHIPS;
 }
 
 bool tlc_ready(int color)
 {
 	return color >= 0 && color < NCOLORS && ready[color];
+}
+
+const struct tlc_chip_info *tlc_chip_info(int color)
+{
+	return &info[color < 0 || color >= NCOLORS ? 0 : color];
+}
+
+const struct tlc_start_info *tlc_start_info(void)
+{
+	return &start_info;
+}
+
+/*
+ * "ok", or why the chip is not in use: "BAD(nack)" when its last failed
+ * transfer saw only a missing ACK (the chip is absent, has no supply or
+ * has another address), "BAD(bus)" for an arbitration loss, a bus error,
+ * a timeout or a busy bus (a line held low, or a chip that answers wrong).
+ */
+const char *tlc_state_name(int color)
+{
+	uint8_t e;
+
+	if (tlc_ready(color))
+		return "ok";
+	e = tlc_chip_info(color)->last_err;
+	return e && !(e & ~TLC_E_AF) ? "BAD(nack)" : "BAD(bus)";
 }
 
 bool tlc_set_group_pwm(int color, uint8_t duty)

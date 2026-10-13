@@ -76,7 +76,7 @@ The console is USB interface 0. It takes one command per line. Use `tsx-ledbar-f
 | --- | --- |
 | `VER` | Firmware name and version |
 | `CAPS` | Features of this firmware |
-| `STATUS` | Levels, 16-bit duties, PWM and group values of each chip, effect, chip state, uptime, start number, failed starts, reset flags, board variant value and LED map |
+| `STATUS` | Levels, 16-bit duties, PWM and group values of each chip, effect, chip state, uptime, start number, failed starts, reset flags, board variant value and LED map. The last two lines show the start of the LED chips and the bus pins: see [LED chips](#led-chips) |
 | `LEDMAP [NAME [PANEL] \| DEFAULT]` | Show the LED map and the list of maps, or use another map until the next start: see [Board variant and LED map](docs/leds.md#board-variant-and-led-map) |
 | `ERRLOG`, `CLEARERR` | Show or clear the [error log](#error-log) |
 | `REBOOT` | Restart the application |
@@ -84,7 +84,8 @@ The console is USB interface 0. It takes one command per line. Use `tsx-ledbar-f
 | `TLCOUTMODE COLOR NUM\|ALL` | Show the output mode of a TLC59116 output. `ALL` shows output 0 |
 | `TLCOUTMODE COLOR NUM\|ALL MODE`, `TLCGROUPMODE`, `TLCBRIGHTNESS` | Refused. In the stock firmware these commands write the LED driver registers directly, past the power limits. Use `LED SET` and `FX` |
 | `TLCRESET` | Reset and initialize the LED driver chips |
-| `TLCREGS COLOR` | Read the registers of one LED driver chip, and show the number of group PWM changes since the start |
+| `TLCREGS COLOR` | Read the registers of one LED driver chip, and show the number of group PWM changes since the start. The third line shows IREF and the error flags EFLAG1 and EFLAG2 |
+| `I2CSCAN [RESET]` | Probe the I2C addresses 0x60 to 0x6F and show the answers, the I2C errors of each chip, the registers of each chip that answers, the pins and a pull-up test: see [LED chips](#led-chips). `RESET` pulses the reset line first and then starts the chips again |
 | `SELFTEST LED ON\|OFF [COLOR\|ALL] [PERCENT]` | Light the LEDs for a test |
 | `LED COLOR LEVEL\|CONTROL\|BLINK VALUE` | Set the host joins by hand |
 | `LED SET`, `LED SIDE`, `LED GET`, `LED CLEAR` | Control of each LED: see [LED control](docs/leds.md) |
@@ -129,11 +130,48 @@ A host join drops the LED pattern, ends a running effect and ramps the bar to th
 | Start guard | The independent watchdog runs from the first instruction (4 s). After three failed starts in a row, the guard hands the bar to the bootloader for an update: see [Start guard](#start-guard) |
 | LED map | The firmware starts with the map of the TSW-1060-LB. The panel service `tsx-ledbard` sends the map of the panel with `LEDMAP` after each plug-in and each start of the bar: see [Board variant and LED map](docs/leds.md#board-variant-and-led-map) |
 | Board variant | At start the firmware reads the variant pins PB13 to PB15 (value 0 to 7). `STATUS` shows the value. The value does not change the behavior |
-| LED chips | The init pulses the reset line and retries up to five times, so a late driver supply at power-up does not leave the bar dark |
+| LED chips | The init first probes the chips with no reset pulse. When a chip is missing, it pulses the reset line and tries again, then it frees the bus. Each chip that answers stays in use: see [LED chips](#led-chips) |
 | LED engine | Runs every 10 ms. Keeps a 16-bit duty for each of the 16 LEDs and each color. A level (0 to 100) maps to a duty with the CIE 1976 lightness curve, so fades do not dwell at the bottom. Effects and fades dim a color in light, so it keeps its hue: see [LED control](docs/leds.md) |
 | Power limit | `FX CAP`: see [LED control](docs/leds.md) |
 | Chip brightness | The product of the PWM of the output and the group PWM. The lowest step is 1/65025 of full brightness. The group PWM goes up when the light of the chip needs it, and it goes down only while the chip is dark: see [LED control](docs/leds.md). One transfer writes the registers that changed |
 | Image | Linked at 0x08020000. The header holds the CRC-16 of the image, the version and the product code 0xE5 |
+
+### LED chips
+
+The three TLC59116 LED driver chips share the I2C bus (SDA, SCL) and one reset line. The init starts them in three steps:
+
+1. Probe: the firmware writes the registers of each chip with no reset pulse, as the stock firmware does. When some chips answer, the driver supply is on. The firmware then asks the other chips again, up to five times, 50 ms apart, still with no pulse.
+2. Reset: when a chip is still missing, the firmware pulses the reset line, waits 50 ms and starts all chips again. A pulse clears every chip, so every chip gets its registers again. This step runs up to five times. It stops early when SDA or SCL stays low after a pulse, or when a pulse costs a chip that answered before.
+3. Recovery: when a chip is still missing, the firmware frees the bus (up to 18 SCL clocks and a STOP) and starts the missing chips again with no pulse.
+
+A bar whose driver supply comes up late gives no answer to the probe. The reset step then gives the supply up to five times 60 ms. A good bar answers the first probe, and the init takes about 7 ms.
+
+Each chip that answers stays in use. The other colors stay dark: the LED engine, the effects, `LED GET` and `SELFTEST` work with the chips that answer. `LED GET` and `SELFTEST` name a chip that is not in use. `TLCOUTMODE` and `TLCREGS` answer "LED driver not initialized!" for it, as the stock firmware does.
+
+`STATUS` shows the result in three lines:
+
+```
+chips ok BAD(nack) ok uptime ...
+start probe red blue (5 rounds), reset red blue (5 pulses), recovery none, 612 ms
+pins power-up SDA 1 SCL 1 RESET 1, idle SDA 1 SCL 1 RESET 1, after reset SDA 1 SCL 1 RESET 1, now SDA 1 SCL 1 RESET 1
+```
+
+- `chips`: the state of the red, green and blue chip. `ok`: in use. `BAD(nack)`: the last transfer got no ACK. The chip is absent, has no supply, or does not see the bus. `BAD(bus)`: the last transfer saw an arbitration loss, a bus error, a timeout or a busy bus. A line is held low, or a chip answers wrong.
+- `start`: the chips that answered in each step, the number of probe rounds and reset pulses, and the time of the init. "not needed" means that the step did not run.
+- `pins`: the levels of SDA, SCL and RESET at power-up, at the init, after the first reset pulse, and now. The firmware reads SDA and SCL as GPIO inputs with the pull-ups of the bus. RESET is an output, so a 0 there means a short to ground. A 0 on SDA or SCL means that the line is held low.
+
+`I2CSCAN` probes each address from 0x60 to 0x6F with a START, the address and a STOP. It sends no data, so the software reset address 0x6B resets nothing. The answer shows:
+
+- The addresses that answer. Red, green and blue are at 0x60, 0x61 and 0x62.
+- 0x68 (all-call): only a chip before its init or after a reset answers here, because the init turns the all-call address off.
+- 0x6B (software reset): every chip with a supply answers here. No answer at 0x6B means that no chip sees the bus.
+- An answer at another address: no chip has this address. Look at the address pins of the chips.
+- The I2C errors of each chip since the init: AF, ARLO, BERR, timeout and busy bus, and the flags of the last failed transfer.
+- MODE1, MODE2, IREF, EFLAG1 and EFLAG2 of each chip that answers.
+- The `start` and `pins` lines of `STATUS`.
+- A pull-up test: the firmware drives SDA and SCL low, releases them with no internal pull-up, and reads them again. "rises" means that the line has a pull-up resistor. "stays low" means that it has none. The firmware tests SDA while SCL is low, so the chips see no START or STOP.
+
+`I2CSCAN RESET` first pulses the reset line and shows the pins after the pulse. After the scan, it starts the chips again with the three steps.
 
 ### Start guard
 
@@ -159,13 +197,14 @@ The guard cannot find a firmware that never connects to the USB bus. Such a firm
 
 | Subsystem | Meaning |
 | --- | --- |
-| 119 | A LED driver chip did not answer at the init. Cause: the chip (0 red, 1 green, 2 blue) |
+| 119 | A LED driver chip did not start at the init. Cause: the chip (0 red, 1 green, 2 blue) in the low byte. The high byte holds the I2C error flags of its last transfer: 0x01 no ACK (AF), 0x02 arbitration lost (ARLO), 0x04 bus error (BERR), 0x08 timeout, 0x10 bus busy |
 | 120 | An I2C transfer failed. Cause: chip x 256 + register |
 | 121 | The last start ended in a reset that the firmware did not plan. Cause 0: the watchdog flag is set. Cause 1: no watchdog flag |
 | 122 | Failed starts in a row. Cause: the count |
 | 123 | A USB IN endpoint did not send, and the firmware reset it. Cause: the endpoint |
 | 124 | The last start ended in a hard fault |
 | 125 | In the last start a USB host ran, but USB did not reach "configured" within 60 s |
+| 126 | Not all LED driver chips started. Cause: bits 0 to 2 are the chips that answered the probe, bits 4 to 6 the chips after the last reset pulse, bits 8 to 10 the chips that the bus recovery started. Bit 12: SDA or SCL was low after a reset pulse. Bit 13: the bus was not free at the end |
 
 ## Build
 
@@ -186,7 +225,7 @@ Needs `arm-none-eabi-gcc` and a libopencm3 tree built for `stm32/f2` (`make TARG
 | `tests/test_flash.py` | Tests of `tsx-ledbar-flash` with a fake bootloader: records, packets, blocks, a bootloader that does not take a packet |
 | `tests/test_panel.py` | Tests of `tsx-ledbar-fw-install --check`, `--recover-image` and `--recover` with a fake sysfs tree, a fake flasher and a fake `rc-service` |
 | `tests/test_ledmap.py` | Checks the LED maps in the firmware, in the test and in `docs/leds.md`: the default map, the map `outputs`, the names |
-| `tests/test_fw_host.py` | Builds and runs the C tests in `tests/host/` with the host compiler: firmware files with fake registers (`tests/host/fake/`) |
-| `qemu/run-test.py ELF` | Runs the QEMU build on the netduino2 machine. Checks the console, the LED engine, the start guard, `LEDMAP` and a start with each variant value. The QEMU build has the command `TEST` for the guard events and a USB time of 20 s. It reads the variant value from RAM, because the machine has no GPIO model |
+| `tests/test_fw_host.py` | Builds and runs the C tests in `tests/host/` with the host compiler: firmware files with fake registers (`tests/host/fake/`). The I2C test has a model of the bus and the chips: absent chips, a chip that needs a reset pulse, a late driver supply, SDA held low after a reset pulse or for good, and a shorted reset line |
+| `qemu/run-test.py ELF` | Runs the QEMU build on the netduino2 machine. Checks the console, the LED engine, the start guard, `LEDMAP`, `I2CSCAN`, a bar with a subset of the LED chips, and a start with each variant value. The QEMU build has the command `TEST` for the guard events and a USB time of 20 s. `TEST CHIPS MASK` sets the chips that answer (bit 0 red, bit 1 green, bit 2 blue) and starts the chips again. The QEMU build reads the variant value from RAM, because the machine has no GPIO model |
 | `qemu/test-leds.py ELF` | QEMU tests of the LEDs: maps (the default map, `LEDMAP`, a start with another variant value), pattern, power limits, dimming, effects, group PWM rules |
 | `docs/` | [LED control](docs/leds.md) and the [update protocol](docs/update-protocol.md) |

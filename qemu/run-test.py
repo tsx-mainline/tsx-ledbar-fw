@@ -250,6 +250,95 @@ def test_variants(elf):
             m.close()
 
 
+def test_chips(m):
+    """The start of the LED driver chips and the diagnosis: I2CSCAN, the
+    chips, start and pins lines of STATUS, and a bar with a subset of the
+    chips. TEST CHIPS MASK sets which chips answer (QEMU has no I2C
+    model) and starts the chips again. Every chip that answers stays in
+    use: LED output, effects, LED GET and SELFTEST work with the others."""
+    check('i2cscan' in m.cmd('CAPS').split(), 'CAPS lists i2cscan')
+    check('I2CSCAN' in m.cmd('HELP', 0.8), 'HELP lists I2CSCAN')
+    out = m.cmd('STATUS')
+    check('chips ok ok ok' in out and
+          'start probe red green blue (1 rounds), reset not needed (0 pulses), recovery not needed' in out,
+          'STATUS: all chips at the first probe, no reset pulse: %s' % out.strip().replace('\r\n', ' | '))
+    check(re.search(r'^pins power-up SDA 1 SCL 1 RESET 1, idle SDA 1 SCL 1 RESET 1, '
+                    r'after reset not read, now SDA 1 SCL 1 RESET 1\r?$', out, re.M) is not None,
+          'STATUS: the pins line')
+    out = m.cmd('I2CSCAN', 0.8)
+    check('i2c scan 0x60..0x6F: ack 0x60 0x61 0x62 0x6B' in out and '0x61 green: ack, chip ok' in out and
+          'red errors af 0 arlo 0 berr 0 timeout 0 busy 0, last none' in out and 'other ack' not in out,
+          'I2CSCAN: the three chips and the software reset address answer: %s' % out.strip().replace('\r\n', ' | '))
+    check('pull-up test: SDA rises, SCL rises' in out, 'I2CSCAN: the pull-up test')
+    check(re.search(r'^blue mode 80 00 iref 00 eflag 00 00\r?$', out, re.M) is not None,
+          'I2CSCAN: the registers of each chip that answers')
+    check('BLUE iref 00 eflag 00 00' in m.cmd('TLCREGS BLUE'), 'TLCREGS shows IREF and EFLAG')
+    check('usage: I2CSCAN' in m.cmd('I2CSCAN X'), 'I2CSCAN X: usage')
+
+    # green does not answer
+    m.cmd('CLEARERR')
+    out = m.cmd('TEST CHIPS 5', 1.5)
+    check('test chips ok BAD(nack) ok' in out, 'TEST CHIPS 5: green BAD(nack): %s' % out.strip())
+    out = m.cmd('STATUS')
+    check('chips ok BAD(nack) ok' in out and
+          'start probe red blue (5 rounds), reset red blue (5 pulses), recovery none' in out,
+          'STATUS: probe and reset keep red and blue: %s' % out.strip().replace('\r\n', ' | '))
+    out, errs = errlog(m)
+    check((119, 0x0101) in errs and (126, 0x0055) in errs and (119, 0) not in errs,
+          'ERRLOG: 119 cause 0x0101 (green, AF) and 126 cause 0x0055: %s' % errs)
+    out = m.cmd('I2CSCAN', 0.8)
+    check('0x61 green: no ack (AF), chip BAD(nack)' in out and 'ack 0x60 0x62 0x6B' in out and
+          re.search(r'^green errors af [1-9]\d* ', out, re.M) and 'green mode' not in out,
+          'I2CSCAN: green gives no ack and has AF errors: %s' % out.strip().replace('\r\n', ' | '))
+    check('not initialized' in m.cmd('TLCOUTMODE GREEN 0') and 'output mode is:3' in m.cmd('TLCOUTMODE RED 0'),
+          'TLCOUTMODE: green not initialized, red answers')
+    check('not initialized' in m.cmd('TLCREGS GREEN') and 'RED mode 80 00' in m.cmd('TLCREGS RED'),
+          'TLCREGS: green not initialized, red answers')
+    for c in ('RED', 'GREEN', 'BLUE'):
+        m.cmd('LED %s CONTROL 0' % c)
+    m.cmd('FX OFF', 0.5)
+    m.cmd('TRACE ON')
+    for c in ('RED', 'GREEN', 'BLUE'):
+        m.cmd('LED %s LEVEL 100' % c)
+        m.cmd('LED %s CONTROL 1' % c)
+    leds = leds_in(m.read_for(0.6))
+    check(leds and leds[-1][1] > 0 and leds[-1][2] == 0 and leds[-1][3] > 0,
+          'host white: red and blue light, green has no chip: %s' % (leds[-1:],))
+    leds = leds_in(m.cmd('FX RAINBOW 500', 1.0))
+    check(len(set(l[1:] for l in leds)) >= 10 and all(l[2] == 0 for l in leds),
+          'FX RAINBOW runs on red and blue: %d colors' % len(set(l[1:] for l in leds)))
+    m.cmd('FX OFF', 0.3)
+    m.cmd('TRACE OFF')
+    out = m.cmd('LED GET R1-R2')
+    check('chips ok BAD(nack) ok' in out and re.search(r'^0 R1 out \d+ level 100 100 100 duty [1-9]\d* 0 [1-9]', out, re.M),
+          'LED GET: the chip states, duties of red and blue: %s' % out.strip().replace('\r\n', ' | '))
+    out = m.cmd('SELFTEST LED ON ALL 50')
+    check('selftest on 50 50 50, green chip BAD(nack)' in out, 'SELFTEST names the missing chip: %s' % out.strip())
+    check('selftest on 0 0 50\r' in m.cmd('SELFTEST LED ON BLUE 50'), 'SELFTEST BLUE: no note')
+    m.cmd('SELFTEST LED OFF')
+
+    # no chip answers: the firmware runs on
+    out = m.cmd('TEST CHIPS 0', 1.5)
+    check('test chips BAD(nack) BAD(nack) BAD(nack)' in out, 'TEST CHIPS 0: %s' % out.strip())
+    out = m.cmd('STATUS')
+    check('start probe none (1 rounds), reset none (5 pulses), recovery none' in out,
+          'STATUS: no chip: 1 probe round, 5 pulses: %s' % out.strip().replace('\r\n', ' | '))
+    m.cmd('FX BREATHE 100 100 100 500', 0.5)
+    check('TSX-LEDBAR [v' in m.cmd('VER') and 'i2c scan 0x60..0x6F: ack none' in m.cmd('I2CSCAN', 0.8),
+          'no chip: the console answers, I2CSCAN finds none')
+    m.cmd('FX OFF')
+
+    # the chips come back: I2CSCAN RESET starts them again
+    m.cmd('TEST CHIPS 7', 1.0)
+    out = m.cmd('I2CSCAN RESET', 1.0)
+    check('reset pulse: pins SDA 1 SCL 1 RESET 1' in out and 'init again: chips ok ok ok' in out,
+          'I2CSCAN RESET: pulse, scan, init again: %s' % out.strip().replace('\r\n', ' | '))
+    for c in ('RED', 'GREEN', 'BLUE'):
+        m.cmd('LED %s CONTROL 0' % c)
+        m.cmd('LED %s LEVEL 0' % c)
+    m.cmd('CLEARERR')
+
+
 def main():
     elf = sys.argv[1]
     m = Machine(elf)
@@ -373,6 +462,7 @@ def main():
         m.cmd('FX OFF')
         m.cmd('TRACE OFF')
 
+        test_chips(m)
         test_guard(m)
     finally:
         m.close()
