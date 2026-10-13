@@ -14,7 +14,7 @@
 
 enum rcc_periph_clken { RCC_I2C1 };
 enum rcc_periph_rst { RST_I2C1 };
-extern uint32_t rcc_apb1_frequency;
+extern uint32_t rcc_apb1_frequency, rcc_ahb_frequency;
 void rcc_periph_clock_enable(enum rcc_periph_clken clken);
 void rcc_periph_reset_pulse(enum rcc_periph_rst rst);
 #endif

@@ -51,10 +51,10 @@ void board_init(void)
 #ifndef TSX_QEMU
 	rcc_clock_setup_hse_3v3(&clock_120mhz_hse25);
 #else
-	rcc_ahb_frequency = SYSCLK_HZ;
 	rcc_apb1_frequency = SYSCLK_HZ;
 	rcc_apb2_frequency = SYSCLK_HZ;
 #endif
+	rcc_ahb_frequency = SYSCLK_HZ;	/* the f2 clock setup does not set it */
 
 	rcc_periph_clock_enable(RCC_GPIOA);
 	rcc_periph_clock_enable(RCC_GPIOB);

@@ -76,6 +76,7 @@ static void note_err(int color, uint8_t err)
 
 #ifndef TSX_QEMU
 
+#include <libopencm3/cm3/dwt.h>
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/i2c.h>
 #include <libopencm3/stm32/rcc.h>
@@ -88,6 +89,7 @@ static void note_err(int color, uint8_t err)
 #define ADDR_ERRORS	(I2C_SR1_AF | I2C_SR1_ARLO | I2C_SR1_BERR)
 
 static uint8_t i2c_err;	/* TLC_E flags of the last failed transfer */
+static bool bus_slow;	/* I2CSCAN SLOW: 10 kHz instead of 100 kHz */
 
 /* the error flags in SR1, or a timeout when none is set */
 static uint8_t sr1_err(void)
@@ -185,6 +187,8 @@ static void i2c_setup(void)
 	rcc_periph_reset_pulse(RST_I2C1);
 	i2c_peripheral_disable(I2C);
 	i2c_set_speed(I2C, i2c_speed_sm_100k, rcc_apb1_frequency / 1000000);
+	if (bus_slow)	/* CCR = APB1 / (2 x 10 kHz) */
+		i2c_set_ccr(I2C, rcc_apb1_frequency / 1000000 * 50);
 	i2c_peripheral_enable(I2C);
 }
 
@@ -402,6 +406,138 @@ uint8_t tlc_pullups(void)
 	return r;
 }
 
+void tlc_bus_slow(bool on)
+{
+	hw_init();
+	bus_slow = on;
+	i2c_fail();
+}
+
+#define RISE_MAX_CYCLES	12000	/* 100 us at 120 MHz */
+
+/* hold a line low for about 10 us */
+static void hold_low(uint16_t pin)
+{
+	gpio_clear(GPIOB, pin);
+	short_wait();
+	short_wait();
+}
+
+/*
+ * Release PIN (an open-drain output that is low, or RESET as an input)
+ * and count the CPU cycles until it reads high. The count includes the
+ * loop, about 20 cycles.
+ */
+static uint32_t rise(uint16_t pin, bool release_by_set)
+{
+	uint32_t t0 = dwt_read_cycle_counter();
+
+	if (release_by_set)
+		gpio_set(GPIOB, pin);
+	else
+		gpio_mode_setup(GPIOB, GPIO_MODE_INPUT, GPIO_PUPD_NONE, pin);
+	while (!gpio_get(GPIOB, pin)) {
+		if (dwt_read_cycle_counter() - t0 > RISE_MAX_CYCLES)
+			return TLC_RISE_NEVER;
+	}
+	return dwt_read_cycle_counter() - t0;
+}
+
+#define NSAMPLES	64
+#define RISE_REPEATS	8
+
+/*
+ * The rise time of SDA or SCL in ns: release the line (an open-drain
+ * output that is low) and read the port 64 times in a row, as fast as the
+ * CPU can. The first high sample gives the time. The step between two
+ * samples is about 30 ns: *step_ns gives it. The test runs 8 times and
+ * keeps the shortest time, so an interrupt in the window does no harm. A
+ * line that is not high after the 64 samples gets the slow count of
+ * rise().
+ */
+static uint32_t rise_ns(uint16_t pin, uint32_t *step_ns)
+{
+	uint16_t smp[NSAMPLES];
+	uint32_t mhz = rcc_ahb_frequency / 1000000, best = TLC_RISE_NEVER, t0, t1, c;
+
+	for (int r = 0; r < RISE_REPEATS; r++) {
+		hold_low(pin);
+		t0 = dwt_read_cycle_counter();
+		GPIO_BSRR(GPIOB) = pin;
+#pragma GCC unroll 64
+		for (int i = 0; i < NSAMPLES; i++)
+			smp[i] = (uint16_t)GPIO_IDR(GPIOB);
+		t1 = dwt_read_cycle_counter();
+		*step_ns = (t1 - t0) * 1000 / NSAMPLES / mhz;
+		for (int i = 0; i < NSAMPLES; i++) {
+			if (smp[i] & pin) {
+				if ((uint32_t)i * *step_ns < best)
+					best = (uint32_t)i * *step_ns;
+				break;
+			}
+		}
+	}
+	if (best == TLC_RISE_NEVER) {
+		hold_low(pin);
+		c = rise(pin, true);
+		if (c != TLC_RISE_NEVER)
+			best = c * 1000 / mhz;
+	}
+	return best;
+}
+
+/* SDA or SCL as an open-drain output, with or without the internal pull-up */
+static void od_pin(uint16_t pin, bool pullup)
+{
+	gpio_set_output_options(GPIOB, GPIO_OTYPE_OD, GPIO_OSPEED_2MHZ, pin);
+	gpio_mode_setup(GPIOB, GPIO_MODE_OUTPUT, pullup ? GPIO_PUPD_PULLUP : GPIO_PUPD_NONE, pin);
+}
+
+/*
+ * PINTEST: the rise time of SDA and SCL after the firmware releases them,
+ * with only the pull-up resistors of the board and with the internal
+ * pull-up too, and the reset line: driven low, driven high, and released
+ * after a low level. SDA moves only while SCL is low, so the chips see no
+ * START or STOP. The reset test resets the chips: the caller starts them
+ * again.
+ */
+void tlc_pintest(struct tlc_pintest *t)
+{
+	hw_init();
+	dwt_enable_cycle_counter();
+	gpio_set(GPIOB, SCL_PIN | SDA_PIN);
+	od_pin(SCL_PIN | SDA_PIN, false);
+	short_wait();
+	t->scl_ext = rise_ns(SCL_PIN, &t->step_ns);
+	od_pin(SCL_PIN, true);
+	t->scl_int = rise_ns(SCL_PIN, &t->step_ns);
+	od_pin(SCL_PIN, false);
+	gpio_clear(GPIOB, SCL_PIN);
+	t->sda_ext = rise_ns(SDA_PIN, &t->step_ns);
+	od_pin(SDA_PIN, true);
+	t->sda_int = rise_ns(SDA_PIN, &t->step_ns);
+	gpio_set(GPIOB, SCL_PIN);
+	short_wait();
+	i2c_pins_af();
+	i2c_fail();
+
+	gpio_clear(GPIOB, RESET_PIN);
+	short_wait();
+	t->rst_low = gpio_get(GPIOB, RESET_PIN) ? 1 : 0;
+	gpio_set(GPIOB, RESET_PIN);
+	short_wait();
+	t->rst_high = gpio_get(GPIOB, RESET_PIN) ? 1 : 0;
+	hold_low(RESET_PIN);
+	t->rst_rise = rise(RESET_PIN, false);
+	if (t->rst_rise != TLC_RISE_NEVER)
+		t->rst_rise = t->rst_rise * 1000 / (rcc_ahb_frequency / 1000000);
+	gpio_set(GPIOB, RESET_PIN);
+	gpio_mode_setup(GPIOB, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, RESET_PIN);
+	/* the latency of the test: RESET is a push-pull output, it drives the edge */
+	t->floor_ns = rise_ns(RESET_PIN, &t->step_ns);
+	gpio_set(GPIOB, RESET_PIN);
+}
+
 #else /* TSX_QEMU */
 
 /* the chips that answer: TEST CHIPS sets them */
@@ -464,6 +600,23 @@ uint8_t tlc_pins(void)
 uint8_t tlc_pullups(void)
 {
 	return TLC_PIN_SDA | TLC_PIN_SCL;
+}
+
+void tlc_bus_slow(bool on)
+{
+	(void)on;
+}
+
+/* QEMU has no GPIO model: fixed values */
+void tlc_pintest(struct tlc_pintest *t)
+{
+	t->sda_ext = t->scl_ext = 120;
+	t->sda_int = t->scl_int = 90;
+	t->rst_low = 0;
+	t->rst_high = 1;
+	t->rst_rise = 1000;
+	t->step_ns = 30;
+	t->floor_ns = 60;
 }
 
 #endif

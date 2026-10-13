@@ -85,7 +85,8 @@ The console is USB interface 0. It takes one command per line. Use `tsx-ledbar-f
 | `TLCOUTMODE COLOR NUM\|ALL MODE`, `TLCGROUPMODE`, `TLCBRIGHTNESS` | Refused. In the stock firmware these commands write the LED driver registers directly, past the power limits. Use `LED SET` and `FX` |
 | `TLCRESET` | Reset and initialize the LED driver chips |
 | `TLCREGS COLOR` | Read the registers of one LED driver chip, and show the number of group PWM changes since the start. The third line shows IREF and the error flags EFLAG1 and EFLAG2 |
-| `I2CSCAN [RESET]` | Probe the I2C addresses 0x60 to 0x6F and show the answers, the I2C errors of each chip, the registers of each chip that answers, the pins and a pull-up test: see [LED chips](#led-chips). `RESET` pulses the reset line first and then starts the chips again |
+| `I2CSCAN [RESET] [SLOW]` | Probe the I2C addresses 0x60 to 0x6F and show the answers, the I2C errors of each chip, the registers of each chip that answers, the pins and a pull-up test: see [LED chips](#led-chips). `RESET` pulses the reset line first and then starts the chips again. `SLOW` probes at 10 kHz instead of 100 kHz |
+| `PINTEST` | Measure the rise time of SDA and SCL, and test the reset line: see [LED chips](#led-chips). The test resets the chips and then starts them again |
 | `SELFTEST LED ON\|OFF [COLOR\|ALL] [PERCENT]` | Light the LEDs for a test |
 | `LED COLOR LEVEL\|CONTROL\|BLINK VALUE` | Set the host joins by hand |
 | `LED SET`, `LED SIDE`, `LED GET`, `LED CLEAR` | Control of each LED: see [LED control](docs/leds.md) |
@@ -171,7 +172,15 @@ pins power-up SDA 1 SCL 1 RESET 1, idle SDA 1 SCL 1 RESET 1, after reset SDA 1 S
 - The `start` and `pins` lines of `STATUS`.
 - A pull-up test: the firmware drives SDA and SCL low, releases them with no internal pull-up, and reads them again. "rises" means that the line has a pull-up resistor. "stays low" means that it has none. The firmware tests SDA while SCL is low, so the chips see no START or STOP.
 
-`I2CSCAN RESET` first pulses the reset line and shows the pins after the pulse. After the scan, it starts the chips again with the three steps.
+`I2CSCAN RESET` first pulses the reset line and shows the pins after the pulse. After the scan, it starts the chips again with the three steps. `I2CSCAN SLOW` probes at 10 kHz. A chip that answers at 10 kHz but not at 100 kHz points to weak pull-ups or a long, loaded bus.
+
+`PINTEST` measures the lines with no I2C transfer:
+
+- SDA and SCL: the firmware holds the line low, releases it, and reads the port 64 times in a row (a step of about 35 ns). The first high sample gives the rise time. The test runs with the pull-up resistors of the board only, then with the internal pull-up too. It runs 8 times and keeps the shortest time. A line that is still low after the 64 samples gets a slower count, up to 100 us. A longer bus, more chips and weaker pull-ups give a longer rise time. "stays low for 100 us" means that the line has no pull-up, or that something holds it low.
+- The first line also shows the latency of the test: the same measurement on an edge that the firmware drives. A rise time near this value means a very light load on the line.
+- RESET: the firmware reads the line back while it drives it low and high. Then it releases the line after a low level and measures the time until it reads high. "stays low for 100 us" means that the reset line has no pull-up.
+
+Compare the values with the values of a good bar on the same controller. On a good bar, the lines reach the three chips, so SDA and SCL have a larger load.
 
 ### Start guard
 

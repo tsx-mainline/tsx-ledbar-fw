@@ -188,7 +188,8 @@ static void cmd_help(void)
 		"TLCOUTMODE COLOR NUM MODE, TLCGROUPMODE, TLCBRIGHTNESS   refused: use LED SET, FX\r\n"
 		"TLCRESET                  reset and init the LED driver chips\r\n"
 		"TLCREGS COLOR             read the registers of a TLC59116\r\n"
-		"I2CSCAN [RESET]           probe 0x60..0x6F, pins, I2C errors of each chip\r\n"
+		"I2CSCAN [RESET] [SLOW]    probe 0x60..0x6F, pins, I2C errors of each chip\r\n"
+		"PINTEST                   rise times of SDA and SCL, the reset line; starts the chips again\r\n"
 		"SELFTEST LED ON|OFF [COLOR|ALL] [PERCENT]\r\n"
 		"LED COLOR LEVEL|CONTROL|BLINK VALUE   the host joins, by hand\r\n"
 		"LED SET LEDS R G B        LEDS: R1..R8, L1..L8, 0..15, A-B, R, L or ALL\r\n"
@@ -323,23 +324,32 @@ static void pins_line(void)
 }
 
 /*
- * I2CSCAN [RESET]: probe each address 0x60..0x6F with START, address,
- * STOP (no data, so 0x6B resets nothing). Then the I2C errors of each
- * chip since the init, the registers of the chips that answer, and the
- * pins. RESET: a reset pulse first, then the scan, then a new init of the
- * chips (the pulse cleared their registers).
+ * I2CSCAN [RESET] [SLOW]: probe each address 0x60..0x6F with START,
+ * address, STOP (no data, so 0x6B resets nothing). Then the I2C errors of
+ * each chip since the init, the registers of the chips that answer, and
+ * the pins. RESET: a reset pulse first, then the scan, then a new init of
+ * the chips (the pulse cleared their registers). SLOW: the scan runs at
+ * 10 kHz, then the bus goes back to 100 kHz.
  */
 static void cmd_i2cscan(int argc, char **argv)
 {
 	uint8_t res[16], regs[TLC_NREGS], pull;
 	char buf[96], buf2[24];
-	bool reset = argc > 1 && eq(argv[1], "RESET");
+	bool reset = false, slow = false;
 	int len = 0;
 
-	if (argc > 1 && !reset) {
-		console_write("usage: I2CSCAN [RESET]\r\n");
-		return;
+	for (int i = 1; i < argc; i++) {
+		if (eq(argv[i], "RESET")) {
+			reset = true;
+		} else if (eq(argv[i], "SLOW")) {
+			slow = true;
+		} else {
+			console_write("usage: I2CSCAN [RESET] [SLOW]\r\n");
+			return;
+		}
 	}
+	if (slow)
+		tlc_bus_slow(true);
 	if (reset) {
 		tlc_reset_pulse();
 		console_printf("reset pulse: pins %s\r\n", pins_text(tlc_pins(), buf2, sizeof(buf2)));
@@ -349,7 +359,7 @@ static void cmd_i2cscan(int argc, char **argv)
 		if (!res[i] && len < (int)sizeof(buf))
 			len += snprintf(buf + len, sizeof(buf) - (size_t)len, " 0x%02X", 0x60 + i);
 	}
-	console_printf("i2c scan 0x60..0x6F: ack%s\r\n", len ? buf : " none");
+	console_printf("i2c scan 0x60..0x6F%s: ack%s\r\n", slow ? " at 10 kHz" : "", len ? buf : " none");
 	for (int c = 0; c < NCOLORS; c++)
 		console_printf("0x%02X %s: %s, chip %s\r\n", 0x60 + c, chip_names[c],
 			       err_text(res[c], buf, sizeof(buf)), tlc_state_name(c));
@@ -382,6 +392,8 @@ static void cmd_i2cscan(int argc, char **argv)
 		else
 			console_printf("%s register read failed\r\n", chip_names[c]);
 	}
+	if (slow)
+		tlc_bus_slow(false);
 	start_line();
 	pins_line();
 	pull = tlc_pullups();
@@ -394,6 +406,43 @@ static void cmd_i2cscan(int argc, char **argv)
 		console_printf("init again: chips %s %s %s\r\n", tlc_state_name(RED),
 			       tlc_state_name(GREEN), tlc_state_name(BLUE));
 	}
+}
+
+static const char *rise_text(uint32_t ns, char *buf, size_t n)
+{
+	if (ns == TLC_RISE_NEVER)
+		snprintf(buf, n, "stays low for 100 us");
+	else
+		snprintf(buf, n, "%lu ns", (unsigned long)ns);
+	return buf;
+}
+
+/*
+ * PINTEST: release SDA and SCL after a low level and measure the time
+ * until they read high, with the pull-up resistors of the board only,
+ * and with the internal pull-up too. Then the reset line: read back
+ * while driven low and high, and released after a low level. The test
+ * resets the chips, so they start again afterwards.
+ */
+static void cmd_pintest(void)
+{
+	struct tlc_pintest t;
+	char a[32], b[32];
+
+	tlc_pintest(&t);
+	console_printf("pin test: time until the line reads high after the release, step %lu ns. "
+		       "A driven edge reads high after %lu ns\r\n", (unsigned long)t.step_ns,
+		       (unsigned long)t.floor_ns);
+	console_printf("SDA: board pull-up %s, with the internal pull-up %s\r\n",
+		       rise_text(t.sda_ext, a, sizeof(a)), rise_text(t.sda_int, b, sizeof(b)));
+	console_printf("SCL: board pull-up %s, with the internal pull-up %s\r\n",
+		       rise_text(t.scl_ext, a, sizeof(a)), rise_text(t.scl_int, b, sizeof(b)));
+	console_printf("RESET: driven low reads %u, driven high reads %u, released after a low level: high after %s\r\n",
+		       t.rst_low, t.rst_high, rise_text(t.rst_rise, a, sizeof(a)));
+	tlc_init();
+	leds_resync();
+	console_printf("init again: chips %s %s %s\r\n", tlc_state_name(RED), tlc_state_name(GREEN),
+		       tlc_state_name(BLUE));
 }
 
 static void cmd_status(void)
@@ -754,7 +803,7 @@ static void run_line(void)
 	if (eq(argv[0], "VER") || eq(argv[0], "VERSION")) {
 		console_write(TSX_FW_NAME "\r\n");
 	} else if (eq(argv[0], "CAPS")) {
-		console_write("tsx-ledbar fade blink breathe rainbow smooth cap status leds16 chase fill spectrum split ledmap i2cscan\r\n");
+		console_write("tsx-ledbar fade blink breathe rainbow smooth cap status leds16 chase fill spectrum split ledmap i2cscan pintest\r\n");
 	} else if (eq(argv[0], "HELP") || eq(argv[0], "?")) {
 		cmd_help();
 	} else if (eq(argv[0], "STATUS")) {
@@ -784,6 +833,8 @@ static void run_line(void)
 		leds_resync();
 	} else if (eq(argv[0], "I2CSCAN")) {
 		cmd_i2cscan(argc, argv);
+	} else if (eq(argv[0], "PINTEST")) {
+		cmd_pintest();
 	} else if (eq(argv[0], "TLCREGS")) {
 		cmd_tlcregs(argc > 1 ? argv[1] : NULL);
 	} else if (eq(argv[0], "TLCOUTMODE") || eq(argv[0], "TLCGROUPMODE") ||

@@ -26,4 +26,9 @@ void gpio_set_af(uint32_t port, uint8_t af, uint16_t gpios);
 void gpio_set(uint32_t port, uint16_t gpios);
 void gpio_clear(uint32_t port, uint16_t gpios);
 uint16_t gpio_get(uint32_t port, uint16_t gpios);
+/* the registers: a write to BSRR acts at the next read of IDR */
+extern volatile uint32_t fake_gpio_bsrr;
+uint32_t fake_gpio_idr(uint32_t port);
+#define GPIO_BSRR(port)		fake_gpio_bsrr
+#define GPIO_IDR(port)		fake_gpio_idr(port)
 #endif

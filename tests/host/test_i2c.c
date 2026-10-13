@@ -11,7 +11,10 @@
  * - SDA can be held low: from the start, or after a reset pulse. The
  *   bus recovery frees it after a number of SCL clocks, or never.
  *   While SDA is low, the I2C peripheral reports a busy bus.
- * - The reset line can be shorted to ground: no chip answers then.
+ * - The reset line can be shorted to ground: no chip answers then. It can
+ *   have a pull-up on the bar, or none.
+ * - SDA and SCL can have a pull-up resistor, or none: a released line with
+ *   no pull-up (internal or on the board) stays low.
  *
  * Each millis() call moves the time on by 1 ms, so a wait of the driver
  * ends after a known number of polls. An alarm ends the test when the
@@ -20,6 +23,7 @@
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
+#include <libopencm3/cm3/dwt.h>
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/i2c.h>
 #include <libopencm3/stm32/rcc.h>
@@ -28,7 +32,7 @@
 
 uint32_t fake_rcc_csr;
 volatile uint32_t fake_i2c_sr1, fake_i2c_sr2, fake_i2c_cr1;
-uint32_t rcc_apb1_frequency = 30000000;
+uint32_t rcc_apb1_frequency = 30000000, rcc_ahb_frequency = 120000000;
 
 enum answer { ACK, NACK, ARLO, BERR, SILENT };
 static const char *const answer_names[] = { "ACK", "no ACK (AF)", "arbitration lost (ARLO)",
@@ -55,7 +59,11 @@ static bool sda_low_after_reset;	/* a reset pulse makes a chip hold SDA low */
 static int release_clocks;		/* SCL clocks that free SDA, -1: never */
 static int clocks;			/* SCL clocks since SDA went low */
 static bool pullup_sda, pullup_scl;	/* the lines have a pull-up resistor */
-static uint16_t floating;		/* pins set as inputs with no internal pull-up */
+static uint16_t floating;		/* pins with no internal pull-up */
+static bool rst_input;			/* RESET is an input (released) */
+static bool rst_pullup;			/* RESET has a pull-up on the bar */
+static uint32_t cycles;			/* the cycle counter */
+static uint16_t ccr;			/* the last i2c_set_ccr value, 0 after i2c_set_speed */
 
 static void model_reset(void)
 {
@@ -72,6 +80,7 @@ static void model_reset(void)
 	clocks = 0;
 	pulses = 0;
 	pullup_sda = pullup_scl = true;
+	rst_pullup = true;
 	fake_i2c_sr2 = 0;
 	errlog_clear();
 }
@@ -117,10 +126,22 @@ void rcc_periph_reset_pulse(enum rcc_periph_rst rst)
 void gpio_mode_setup(uint32_t port, uint8_t mode, uint8_t pull, uint16_t gpios)
 {
 	(void)port;
-	if (mode == GPIO_MODE_INPUT && pull == GPIO_PUPD_NONE)
+	if ((mode == GPIO_MODE_INPUT || mode == GPIO_MODE_OUTPUT) && pull == GPIO_PUPD_NONE)
 		floating |= gpios;
 	else
 		floating &= (uint16_t)~gpios;
+	if (gpios & GPIO12)
+		rst_input = mode == GPIO_MODE_INPUT;
+}
+
+bool dwt_enable_cycle_counter(void)
+{
+	return true;
+}
+
+uint32_t dwt_read_cycle_counter(void)
+{
+	return cycles += 300;	/* the time moves on between two reads */
 }
 
 void gpio_set_output_options(uint32_t port, uint8_t otype, uint8_t speed, uint16_t gpios)
@@ -156,6 +177,20 @@ void gpio_clear(uint32_t port, uint16_t gpios)
 		set_sda_low(false);
 }
 
+volatile uint32_t fake_gpio_bsrr;
+
+uint32_t fake_gpio_idr(uint32_t port)
+{
+	uint32_t b = fake_gpio_bsrr;
+
+	fake_gpio_bsrr = 0;
+	if (b & 0xFFFF)
+		gpio_set(port, (uint16_t)b);
+	if (b >> 16)
+		gpio_clear(port, (uint16_t)(b >> 16));
+	return gpio_get(port, 0xFFFF);
+}
+
 uint16_t gpio_get(uint32_t port, uint16_t gpios)
 {
 	uint16_t v = GPIO6;
@@ -168,7 +203,7 @@ uint16_t gpio_get(uint32_t port, uint16_t gpios)
 		v &= (uint16_t)~GPIO7;
 	if ((floating & GPIO6) && !pullup_scl)
 		v &= (uint16_t)~GPIO6;
-	if (rst_level && !rst_shorted)
+	if ((rst_input ? rst_pullup : rst_level) && !rst_shorted)
 		v |= GPIO12;
 	return v & gpios;
 }
@@ -186,6 +221,13 @@ void i2c_peripheral_disable(uint32_t i2c)
 void i2c_set_speed(uint32_t i2c, enum i2c_speeds speed, uint32_t clock_megahz)
 {
 	(void)i2c; (void)speed; (void)clock_megahz;
+	ccr = 0;
+}
+
+void i2c_set_ccr(uint32_t i2c, uint16_t freq)
+{
+	(void)i2c;
+	ccr = freq;
 }
 
 void i2c_send_start(uint32_t i2c)
@@ -491,8 +533,43 @@ static void test_scan(void)
 	pullup_sda = true;
 	CHECK(tlc_pullups() == TLC_PIN_SDA, "pull-up test: SCL with no pull-up stays low");
 	model_reset();
-	CHECK(tlc_init() && tlc_chip_info(RED)->af + tlc_chip_info(RED)->busy == 0 && floating == 0,
+	CHECK(tlc_init() && tlc_chip_info(RED)->af + tlc_chip_info(RED)->busy == 0 &&
+	      (floating & (GPIO6 | GPIO7)) == 0,
 	      "after the pull-up test: the chips start with no error, no pin floats");
+}
+
+static void test_pintest(void)
+{
+	struct tlc_pintest t;
+
+	model_reset();
+	tlc_pintest(&t);
+	CHECK(t.sda_ext == 0 && t.sda_int == 0 && t.scl_ext == 0 && t.scl_int == 0 && t.step_ns > 0,
+	      "pin test: SDA and SCL high at the first sample (%u %u %u %u ns, step %u ns)",
+	      t.sda_ext, t.sda_int, t.scl_ext, t.scl_int, t.step_ns);
+	CHECK(t.rst_low == 0 && t.rst_high == 1 && t.rst_rise != TLC_RISE_NEVER && t.floor_ns == 0 &&
+	      !rst_input && rst_level,
+	      "pin test: RESET reads 0 and 1, rises when released, and is an output high again");
+	CHECK((floating & (GPIO6 | GPIO7)) == 0 && tlc_init() && ready_mask() == 7,
+	      "pin test: no pin floats after it, the chips start");
+	pullup_sda = false;
+	tlc_pintest(&t);
+	CHECK(t.sda_ext == TLC_RISE_NEVER && t.sda_int < 100 && t.scl_ext < 100,
+	      "pin test, SDA with no pull-up: stays low with the board pull-up only, rises with the internal one");
+	model_reset();
+	rst_pullup = false;
+	tlc_pintest(&t);
+	CHECK(t.rst_rise == TLC_RISE_NEVER && t.rst_high == 1,
+	      "pin test, RESET with no pull-up on the bar: stays low when released");
+	rst_shorted = true;
+	tlc_pintest(&t);
+	CHECK(t.rst_high == 0 && t.rst_low == 0, "pin test, RESET shorted: reads 0 while driven high");
+	model_reset();
+
+	tlc_bus_slow(true);
+	CHECK(ccr == 1500, "SLOW: CCR 1500, 10 kHz at 30 MHz (%u)", ccr);
+	tlc_bus_slow(false);
+	CHECK(ccr == 0 && tlc_init(), "SLOW off: 100 kHz again, the chips start");
 }
 
 int main(void)
@@ -503,5 +580,6 @@ int main(void)
 	test_partial();
 	test_bus_low();
 	test_scan();
+	test_pintest();
 	DONE("test_i2c");
 }

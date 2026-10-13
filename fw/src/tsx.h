@@ -102,6 +102,17 @@ const char *tlc_state_name(int color);	/* "ok", "BAD(nack)" or "BAD(bus)" */
 uint8_t tlc_probe(uint8_t addr);	/* I2CSCAN: 0 = ACK, else TLC_E flags */
 uint8_t tlc_pins(void);			/* SDA, SCL and RESET now: TLC_PIN bits */
 uint8_t tlc_pullups(void);		/* TLC_PIN bit set: the line has a pull-up */
+void tlc_bus_slow(bool on);		/* I2CSCAN SLOW: the bus at 10 kHz, or 100 kHz again */
+#define TLC_RISE_NEVER		0xFFFFFFFFU	/* the line did not rise within 100 us */
+struct tlc_pintest {
+	uint32_t sda_ext, sda_int;	/* ns to rise: board pull-up only, internal too */
+	uint32_t scl_ext, scl_int;
+	uint32_t step_ns;		/* the time between two samples */
+	uint32_t floor_ns;		/* the same test on a driven edge: the latency */
+	uint8_t rst_low, rst_high;	/* RESET read back while driven low, high */
+	uint32_t rst_rise;		/* ns to rise, released after a low level */
+};
+void tlc_pintest(struct tlc_pintest *t);	/* PINTEST: resets the chips */
 bool tlc_read_all(int color, uint8_t regs[TLC_NREGS]);	/* from the chip */
 #ifdef TSX_QEMU
 void tlc_qemu_chips(uint8_t mask);	/* TEST CHIPS: bit c = chip c answers */

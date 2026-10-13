@@ -31,6 +31,7 @@ enum i2c_speeds { i2c_speed_sm_100k };
 void i2c_peripheral_enable(uint32_t i2c);
 void i2c_peripheral_disable(uint32_t i2c);
 void i2c_set_speed(uint32_t i2c, enum i2c_speeds speed, uint32_t clock_megahz);
+void i2c_set_ccr(uint32_t i2c, uint16_t freq);
 void i2c_send_start(uint32_t i2c);
 void i2c_send_stop(uint32_t i2c);
 void i2c_send_7bit_address(uint32_t i2c, uint8_t slave, uint8_t readwrite);

@@ -274,6 +274,14 @@ def test_chips(m):
           'I2CSCAN: the registers of each chip that answers')
     check('BLUE iref 00 eflag 00 00' in m.cmd('TLCREGS BLUE'), 'TLCREGS shows IREF and EFLAG')
     check('usage: I2CSCAN' in m.cmd('I2CSCAN X'), 'I2CSCAN X: usage')
+    out = m.cmd('I2CSCAN SLOW', 0.8)
+    check('i2c scan 0x60..0x6F at 10 kHz: ack 0x60 0x61 0x62 0x6B' in out, 'I2CSCAN SLOW: %s' % out.strip().split('\r\n')[0])
+    check('pintest' in m.cmd('CAPS').split(), 'CAPS lists pintest')
+    out = m.cmd('PINTEST', 0.8)
+    check(re.search(r'^SDA: board pull-up \d+ ns, with the internal pull-up \d+ ns\r?$', out, re.M) and
+          'RESET: driven low reads 0, driven high reads 1, released after a low level: high after 1000 ns' in out and
+          'init again: chips ok ok ok' in out,
+          'PINTEST: rise times, the reset line, the chips start again: %s' % out.strip().replace('\r\n', ' | '))
 
     # green does not answer
     m.cmd('CLEARERR')
