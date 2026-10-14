@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Tests of the 16 LEDs (0.1.7): the LED maps, the LED pattern commands,
+"""Tests of the 16 LEDs (0.1.8): the LED maps, the LED pattern commands,
 the per-LED limit and the cap over all LEDs, the per-output dimming
 values, the zone effects, and the one-color behavior of 0.1.2.
 
@@ -205,7 +205,7 @@ def all_off(m):
 
 def test_features(m):
     out = m.cmd('VER')
-    check('[v0.1.7]' in out, 'VER is 0.1.7: %s' % out.strip())
+    check('[v0.1.8]' in out, 'VER is 0.1.8: %s' % out.strip())
     out = m.cmd('CAPS')
     check(all(w in out.split() for w in ('leds16', 'chase', 'fill', 'spectrum', 'split')),
           'CAPS lists leds16 chase fill spectrum split: %s' % out.strip())

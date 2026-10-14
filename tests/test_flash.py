@@ -482,7 +482,7 @@ class Entry(unittest.TestCase):
         self.assertEqual(packets, [flash.PKT_PREPARE])
 
     def test_our_firmware_uses_the_prepare_packet(self):
-        got, console, packets, out = self.run_entry('TSX-LEDBAR [v0.1.7]')
+        got, console, packets, out = self.run_entry('TSX-LEDBAR [v0.1.8]')
         self.assertEqual(console, [])
         self.assertEqual(packets, [flash.PKT_PREPARE])
 
