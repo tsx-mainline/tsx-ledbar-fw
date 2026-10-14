@@ -479,5 +479,56 @@ class Info(unittest.TestCase):
         self.assertEqual(sent, ['VER'])
 
 
+
+class PortChoice(unittest.TestCase):
+    """port-reset disables the hub port of the bar only. A bar behind an
+    external hub (1-1.3) gets port 3 of that hub, never the root port of
+    the hub, which can also hold the network adapter."""
+
+    def tree(self, root_dev_vendor=None):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__('shutil').rmtree(d))
+        rootport = os.path.join(d, 'usb1', '1-0:1.0', 'usb1-port1')
+        hubport = os.path.join(d, '1-1', '1-1:1.0', '1-1-port3')
+        for p in (rootport, hubport):
+            os.makedirs(p)
+            open(os.path.join(p, 'disable'), 'w').close()
+        if root_dev_vendor:
+            os.makedirs(os.path.join(d, 'hubdev'))
+            with open(os.path.join(d, 'hubdev', 'idVendor'), 'w') as f:
+                f.write(root_dev_vendor + '\n')
+            os.symlink(os.path.join(d, 'hubdev'), os.path.join(rootport, 'device'))
+        os.makedirs(os.path.join(d, '1-1.3'))
+        os.symlink(hubport, os.path.join(d, '1-1.3', 'port'))
+        return d, rootport, hubport
+
+    def test_bar_behind_a_hub(self):
+        d, rootport, hubport = self.tree('0424')
+        with mock.patch.object(flash, 'USB_DEVICES', d):
+            bar = flash.Bar('1-1.3', '/dev/null', '001a')
+            self.assertEqual(flash.port_disable_path(bar), os.path.join(os.path.realpath(hubport), 'disable'))
+
+    def test_no_bar_root_port_with_a_hub(self):
+        d, rootport, hubport = self.tree('0424')
+        with mock.patch.object(flash, 'USB_DEVICES', d):
+            self.assertIsNone(flash.port_disable_path(None))
+
+    def test_no_bar_empty_root_port(self):
+        d, rootport, hubport = self.tree()
+        with mock.patch.object(flash, 'USB_DEVICES', d):
+            self.assertEqual(flash.port_disable_path(None), os.path.join(rootport, 'disable'))
+
+    def test_no_bar_root_port_with_a_bar(self):
+        d, rootport, hubport = self.tree('14be')
+        with mock.patch.object(flash, 'USB_DEVICES', d):
+            self.assertEqual(flash.port_disable_path(None), os.path.join(rootport, 'disable'))
+
+    def test_bar_with_no_port_link(self):
+        d, rootport, hubport = self.tree('0424')
+        os.remove(os.path.join(d, '1-1.3', 'port'))
+        with mock.patch.object(flash, 'USB_DEVICES', d):
+            self.assertIsNone(flash.port_disable_path(flash.Bar('1-1.3', '/dev/null', '001b')))
+
+
 if __name__ == '__main__':
     unittest.main()

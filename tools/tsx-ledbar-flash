@@ -239,23 +239,45 @@ def wait_for(pred, timeout_s, what):
     return None
 
 
+USB_DEVICES = '/sys/bus/usb/devices'
+
+
+def port_device_ok(port_dir):
+    """True when the device on this hub port is a bar (14be) or the port
+    is empty. A port with another device (a hub with the network adapter,
+    for example) must never be disabled."""
+    dev = os.path.join(port_dir, 'device')
+    if not os.path.exists(dev):
+        return True
+    try:
+        with open(os.path.join(dev, 'idVendor')) as f:
+            return f.read().strip() == VID
+    except OSError:
+        return False
+
+
 def port_disable_path(bar=None):
-    """The sysfs "disable" file of the root hub port the bar is on."""
+    """The sysfs "disable" file of the hub port the bar is on: the root
+    hub port, or the port of an external hub (bus 1-1.3 is port 3 of the
+    hub 1-1). Without a bar on USB, port 1 of a root hub, but only when
+    that port is empty or holds a bar."""
     if bar and '-' in bar.sysname and ':' not in bar.sysname:
-        bus, port = bar.sysname.split('-', 1)
-        if '.' not in port:
-            p = '/sys/bus/usb/devices/usb%s/%s-0:1.0/usb%s-port%s/disable' % (bus, bus, bus, port)
+        link = os.path.join(USB_DEVICES, bar.sysname, 'port')
+        if os.path.exists(link):
+            p = os.path.join(os.path.realpath(link), 'disable')
             if os.path.exists(p):
                 return p
-    for p in sorted(glob.glob('/sys/bus/usb/devices/usb*/*-0:1.0/usb*-port1/disable')):
-        return p
+        return None
+    for p in sorted(glob.glob(USB_DEVICES + '/usb*/*-0:1.0/usb*-port1/disable')):
+        if port_device_ok(os.path.dirname(p)):
+            return p
     return None
 
 
 def port_reset(bar=None, off_s=3.0):
     p = port_disable_path(bar)
     if p is None:
-        die('no USB port power control found')
+        die('no USB port of the bar found that is safe to disable (the port of the bar, or an empty root port 1)')
     log('USB port disabled (%s)' % p)
     with open(p, 'w') as f:
         f.write('1')
