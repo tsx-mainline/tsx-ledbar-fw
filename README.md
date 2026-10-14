@@ -223,6 +223,30 @@ Needs `arm-none-eabi-gcc` and a libopencm3 tree built for `stm32/f2` (`make TARG
 2. Run `make LIBOPENCM3_DIR=/path/to/libopencm3`. The result is `build/tsx-ledbar.upg`, the file that the bar bootloader takes.
 3. For the QEMU build, run `make LIBOPENCM3_DIR=/path/to/libopencm3 qemu`. The result is `build/qemu/tsx-ledbar-qemu.elf`.
 
+The release image comes from this toolchain: Debian 13 packages `gcc-arm-none-eabi`, `libnewlib-arm-none-eabi` and `binutils-arm-none-eabi` (GCC 14.2.1), and libopencm3 at commit `ddcbb2889fa018626c604e27ea50e66db5755b78`. The build is reproducible. The image holds no path and no time, so the same source and the same toolchain give the same file. Another compiler version can give another file that works the same way.
+
+## Releases
+
+A tag `vVERSION` makes the workflow `release` build the image and attach it to the GitHub release of the tag. The tag must match `TSX_VERSION_STR` in `fw/src/tsx.h`. The workflow runs the unit tests and the QEMU tests before it attaches anything. A release has three assets:
+
+| Asset | Contents |
+| --- | --- |
+| `tsx-ledbar-VERSION.upg` | The image that the bar bootloader takes |
+| `BUILDINFO` | The version, the commit of this repo, the libopencm3 commit, the toolchain versions, the link to the build and the SHA-256 sum of the image |
+| `SHA256SUMS` | The SHA-256 sums of the image and of `BUILDINFO` |
+
+No Crestron file goes into a release. For a tag that exists already, start the workflow `release` by hand and give the tag. This replaces the assets of that release. The workflow `ci` builds the image and runs the tests on each push and pull request.
+
+### Check an image
+
+1. Download the three assets of the release into one directory.
+2. Run `sha256sum -c SHA256SUMS`. Each line must show `OK`.
+3. Run `python3 tools/tsx-upg.py verify tsx-ledbar-VERSION.upg`. The command checks the records, the address range, the header and the CRC. It shows `ok`.
+4. Run `python3 tools/tsx-upg.py info tsx-ledbar-VERSION.upg`. The version must be the version of the release.
+5. Optional: build the image again. Check out the commit that `BUILDINFO` names, install the toolchain and libopencm3 as in [Build](#build), and run `make`. `sha256sum fw/build/tsx-ledbar.upg` must give the sum in `BUILDINFO`.
+
+The package `tsx-ledbar-fw` builds the image again from the source of the tag with the Alpine toolchain. That compiler is not the compiler of the release, so the packaged image is another file. It does not have the sum in `SHA256SUMS`. It passes step 3.
+
 ## Repo layout
 
 | Path | Contents |
@@ -237,4 +261,5 @@ Needs `arm-none-eabi-gcc` and a libopencm3 tree built for `stm32/f2` (`make TARG
 | `tests/test_fw_host.py` | Builds and runs the C tests in `tests/host/` with the host compiler: firmware files with fake registers (`tests/host/fake/`). The I2C test has a model of the bus and the chips: absent chips, a chip that needs a reset pulse, a late driver supply, SDA held low after a reset pulse or for good, and a shorted reset line |
 | `qemu/run-test.py ELF` | Runs the QEMU build on the netduino2 machine. Checks the console, the LED engine, the start guard, `LEDMAP`, `I2CSCAN`, a bar with a subset of the LED chips, and a start with each variant value. The QEMU build has the command `TEST` for the guard events and a USB time of 20 s. `TEST CHIPS MASK` sets the chips that answer (bit 0 red, bit 1 green, bit 2 blue) and starts the chips again. The QEMU build reads the variant value from RAM, because the machine has no GPIO model |
 | `qemu/test-leds.py ELF` | QEMU tests of the LEDs: maps (the default map, `LEDMAP`, a start with another variant value), pattern, power limits, dimming, effects, group PWM rules |
+| `.github/workflows/` | `ci.yml` (build and tests on each push), `release.yml` (the image of a tag), `build.yml` (the build that both use) |
 | `docs/` | [LED control](docs/leds.md) and the [update protocol](docs/update-protocol.md) |

@@ -1,0 +1,78 @@
+name: release
+# A tag v* builds the firmware image and attaches it to the GitHub release of
+# the tag. A manual run does the same for an existing tag: use it for a tag
+# that was set before this workflow existed. A manual run replaces the assets
+# of the release.
+#
+# Assets of a release:
+#   tsx-ledbar-VERSION.upg  the image that the bar bootloader takes
+#   BUILDINFO               the commits, the toolchain and the sum of the image
+#   SHA256SUMS              the sums of the two files above
+#
+# No file from Crestron goes into a release. The stock image of the bar stays
+# out of this repo and out of its releases.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'An existing tag (for example v0.1.7)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tsx-ledbar-firmware
+          path: dist
+
+      - name: check the files
+        run: |
+          set -eu
+          case "$TAG" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "bad tag name: $TAG"; exit 1;; esac
+          V=${{ needs.build.outputs.version }}
+          [ "$TAG" = "v$V" ] || { echo "the tag $TAG does not match the firmware version $V"; exit 1; }
+          cd dist
+          # Only these three files go to the release.
+          [ "$(ls | tr '\n' ' ')" = "BUILDINFO SHA256SUMS tsx-ledbar-$V.upg " ]
+          sha256sum -c SHA256SUMS
+          ls -l
+
+      - name: create or update the release of ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          V=${{ needs.build.outputs.version }}
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            printf '%s\n' \
+              "Firmware image of tsx-ledbar-fw $V for the USB LED bar." \
+              "" \
+              "Check the image with SHA256SUMS: see the section Releases in the README." \
+              "The build record is in BUILDINFO." > notes.txt
+            gh release create "$TAG" --verify-tag --title "tsx-ledbar-fw $V" --notes-file notes.txt
+          fi
+          gh release upload "$TAG" dist/* --clobber
+          gh release view "$TAG" --json assets --jq '.assets[] | .name + "  " + (.size|tostring)'

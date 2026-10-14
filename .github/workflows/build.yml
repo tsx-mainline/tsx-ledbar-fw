@@ -1,0 +1,154 @@
+name: build
+# The build and the tests of the firmware. ci.yml and release.yml call this
+# workflow, so both build the image in the same way.
+#
+# The job runs in a Debian 13 container. This is the toolchain of the build
+# host of the maintainer (gcc-arm-none-eabi 14.2.1, newlib 4.5.0), so the
+# image is the same byte for byte. The tools are Debian packages: BUILDINFO
+# records their versions.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'The ref to build (a tag, a branch or a commit). Empty: the ref of the caller'
+        type: string
+        default: ''
+      tests:
+        description: 'Run the unit tests and the QEMU tests'
+        type: boolean
+        default: true
+    outputs:
+      version:
+        description: 'The firmware version'
+        value: ${{ jobs.build.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    outputs:
+      version: ${{ steps.build.outputs.version }}
+    env:
+      # libopencm3 for the stm32/f2. The commit is the one that the build
+      # host and the package recipe of tsx-aports use.
+      LIBOPENCM3_COMMIT: ddcbb2889fa018626c604e27ea50e66db5755b78
+      LIBOPENCM3_URL: https://github.com/libopencm3/libopencm3.git
+    steps:
+      - name: install the tools
+        run: |
+          set -eu
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends \
+            ca-certificates git make python3 gcc libc6-dev \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi binutils-arm-none-eabi \
+            qemu-system-arm tar zstd
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: toolchain versions
+        id: tools
+        run: |
+          set -eu
+          GCC=$(arm-none-eabi-gcc --version | head -n 1)
+          echo "gcc=$GCC" | tee -a "$GITHUB_OUTPUT"
+          # The key changes with the compiler, so a new compiler builds libopencm3 again.
+          echo "key=$(dpkg-query -W -f='${Version}' gcc-arm-none-eabi)" >> "$GITHUB_OUTPUT"
+
+      - name: cache libopencm3
+        id: lcm3
+        uses: actions/cache@v4
+        with:
+          path: libopencm3
+          key: libopencm3-${{ env.LIBOPENCM3_COMMIT }}-${{ steps.tools.outputs.key }}
+
+      - name: build libopencm3 (stm32/f2)
+        if: steps.lcm3.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          git init -q libopencm3
+          cd libopencm3
+          git fetch -q --depth 1 "$LIBOPENCM3_URL" "$LIBOPENCM3_COMMIT"
+          git checkout -q FETCH_HEAD
+          [ "$(git rev-parse HEAD)" = "$LIBOPENCM3_COMMIT" ]
+          rm -rf .git
+          unset CFLAGS CPPFLAGS CXXFLAGS LDFLAGS
+          make TARGETS=stm32/f2 -j"$(nproc)"
+
+      - name: build the firmware
+        id: build
+        run: |
+          set -eu
+          unset CFLAGS CPPFLAGS CXXFLAGS LDFLAGS
+          make -C fw LIBOPENCM3_DIR="$PWD/libopencm3"
+          make -C fw LIBOPENCM3_DIR="$PWD/libopencm3" qemu
+          VERSION=$(sed -n 's/^#define TSX_VERSION_STR[[:space:]]*"\([^"]*\)".*/\1/p' fw/src/tsx.h)
+          [ -n "$VERSION" ]
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+          cp fw/build/tsx-ledbar.upg "dist/tsx-ledbar-$VERSION.upg"
+
+      # A second build in another directory must give the same image. The
+      # image holds no path and no time.
+      - name: build again in another directory and compare
+        run: |
+          set -eu
+          unset CFLAGS CPPFLAGS CXXFLAGS LDFLAGS
+          D=$(mktemp -d)
+          mkdir "$D/other-dir"
+          git archive HEAD | tar -x -C "$D/other-dir"
+          make -C "$D/other-dir/fw" LIBOPENCM3_DIR="$PWD/libopencm3"
+          cmp "$D/other-dir/fw/build/tsx-ledbar.upg" fw/build/tsx-ledbar.upg
+          echo "same image in a second build"
+
+      - name: verify the image
+        run: |
+          set -eu
+          VERSION=${{ steps.build.outputs.version }}
+          python3 tools/tsx-upg.py info "dist/tsx-ledbar-$VERSION.upg"
+          python3 tools/tsx-upg.py verify "dist/tsx-ledbar-$VERSION.upg"
+
+      - name: unit tests
+        if: inputs.tests
+        run: python3 -m unittest discover -v -s tests -p 'test_*.py'
+
+      - name: QEMU tests
+        if: inputs.tests
+        run: |
+          set -eu
+          ELF=fw/build/qemu/tsx-ledbar-qemu.elf
+          python3 qemu/run-test.py "$ELF"
+          python3 qemu/test-leds.py "$ELF"
+
+      - name: BUILDINFO and SHA256SUMS
+        run: |
+          set -eu
+          VERSION=${{ steps.build.outputs.version }}
+          IMG=tsx-ledbar-$VERSION.upg
+          {
+            echo "image: $IMG"
+            echo "version: $VERSION"
+            echo "tsx-ledbar-fw commit: $(git rev-parse HEAD)"
+            echo "libopencm3 commit: $LIBOPENCM3_COMMIT"
+            echo "toolchain: ${{ steps.tools.outputs.gcc }}"
+            echo "binutils: $(dpkg-query -W -f='${Package} ${Version}' binutils-arm-none-eabi)"
+            echo "newlib: $(dpkg-query -W -f='${Package} ${Version}' libnewlib-arm-none-eabi)"
+            echo "build system: $(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "sha256: $(sha256sum "dist/$IMG" | cut -d' ' -f1)"
+          } > dist/BUILDINFO
+          (cd dist && sha256sum "$IMG" BUILDINFO > SHA256SUMS)
+          (cd dist && sha256sum -c SHA256SUMS)
+          cat dist/BUILDINFO
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tsx-ledbar-firmware
+          path: dist
+          if-no-files-found: error
+          retention-days: 14

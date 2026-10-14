@@ -1,0 +1,12 @@
+name: ci
+# Every push and pull request: build the image and run the tests.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
