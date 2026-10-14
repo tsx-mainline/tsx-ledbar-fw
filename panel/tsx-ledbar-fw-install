@@ -9,6 +9,16 @@
 #                                    print the image that --recover loads, exit 3 when
 #                                    there is none
 #   tsx-ledbar-fw-install --recover  load that image into a bar in bootloader mode
+#   tsx-ledbar-fw-install --status   show the bar, the packaged image and a pending load
+#   tsx-ledbar-fw-install --note-upgrade
+#                                    for the post-upgrade hook: record that a newer
+#                                    image is waiting. It never loads the bar.
+#
+# A package upgrade never loads the bar. A load that stops half way (power loss
+# after the erase) can leave a bar that USB cannot recover, so a person starts
+# every load of the application. After an upgrade the hook writes the file
+# ledbar-fw.pending in /data/tsx (the version of the bar and the new version).
+# Run tsx-ledbar-fw-install to load the image. A good load removes the file.
 #
 # --recover is for the tsx-ledbar service (tsx-ledbard). It loads the image that
 # the panel is set up for. The marker means TSX-LEDBAR: the packaged image.
@@ -17,13 +27,14 @@
 # when the panel has no stock image, the packaged image is the last choice.
 # --recover keeps the tsx-ledbar service running, because the service calls it.
 # It does not write or remove the marker, and it does not touch a bar that
-# runs its application.
+# runs its application. A bar in bootloader mode has no application to lose.
 #
 # The install writes a marker in /data/tsx (ledbar-fw.installed). While the
-# marker exists, a package upgrade loads the new image again. The marker goes
-# away with tsx-ledbar-fw-uninstall, which loads the stock image back.
+# marker exists, a package upgrade records a newer image as pending. The marker
+# goes away with tsx-ledbar-fw-uninstall, which loads the stock image back.
 IMAGE=${TSX_LEDBAR_FW_IMAGE:-/usr/share/tsx-ledbar-fw/tsx-ledbar.upg}
 MARKER=${TSX_LEDBAR_FW_MARKER:-/data/tsx/ledbar-fw.installed}
+PENDING=${TSX_LEDBAR_FW_PENDING:-/data/tsx/ledbar-fw.pending}
 STOCK_DIR=${TSX_LEDBAR_STOCK_DIR:-/data/tsx/vendor}
 FLASH=${TSX_LEDBAR_FLASH:-tsx-ledbar-flash}
 LIB=${TSX_LEDBAR_FW_LIB:-/usr/local/lib/tsx-ledbar-fw}
@@ -81,13 +92,78 @@ image_version() {
 	echo "$info" | sed -n 's/^ *version *ok *//p'
 }
 
+# what the bar runs, in a few words: "tsx-ledbar 0.1.7", the firmware name
+# of another firmware, "bootloader mode" or "no bar"
+bar_state() {
+	have=$(bar_firmware)
+	case $have in
+	*"TSX-LEDBAR [v"*"]"*)
+		v=${have#*TSX-LEDBAR \[v}
+		echo "tsx-ledbar ${v%%]*}";;
+	"")
+		if bar_in_bootloader; then echo "bootloader mode"; else echo "no bar"; fi;;
+	*) echo "\"$have\"";;
+	esac
+}
+
+# Forget a pending load when the bar runs the packaged version already (a load
+# by hand with tsx-ledbar-flash, or a load by an earlier tool). Best effort.
+drop_stale_pending() {
+	[ -e "$PENDING" ] || return 0
+	case $(bar_firmware) in
+	*"TSX-LEDBAR [v$1]"*) rm -f "$PENDING" 2>/dev/null;;
+	esac
+	return 0
+}
+
 case $1 in
+--note-upgrade)
+	# Never loads the bar and never fails the upgrade.
+	if [ ! -e "$MARKER" ]; then
+		rm -f "$PENDING" 2>/dev/null
+		exit 0
+	fi
+	want=$(image_version "$IMAGE") && [ -n "$want" ] || {
+		echo "tsx-ledbar-fw: cannot read the version of $IMAGE, the bar is not touched" >&2
+		exit 0
+	}
+	case $(bar_firmware) in
+	*"TSX-LEDBAR [v$want]"*)
+		rm -f "$PENDING" 2>/dev/null
+		exit 0;;
+	esac
+	old=$(bar_state)
+	{
+		echo "old=$old"
+		echo "new=tsx-ledbar $want"
+		echo "date=$(date '+%F %T')"
+	} > "$PENDING" 2>/dev/null ||
+		echo "tsx-ledbar-fw: cannot write $PENDING" >&2
+	echo "tsx-ledbar-fw: a new bar firmware ($want) is available, the bar runs $old. The upgrade does not load it. Run tsx-ledbar-fw-install to load it."
+	exit 0;;
+--status)
+	want=$(image_version "$IMAGE") && [ -n "$want" ] || want="unknown"
+	echo "packaged image: tsx-ledbar $want"
+	echo "bar: $(bar_state)"
+	if [ -e "$MARKER" ]; then
+		echo "marker: installed ($(cat "$MARKER" 2>/dev/null))"
+	else
+		echo "marker: not installed (package upgrades leave the bar alone)"
+	fi
+	[ "$want" = unknown ] || drop_stale_pending "$want"
+	if [ -e "$PENDING" ]; then
+		echo "pending: $(sed -n 's/^old=//p' "$PENDING") -> $(sed -n 's/^new=//p' "$PENDING")"
+		echo "Run tsx-ledbar-fw-install to load the packaged image."
+	else
+		echo "pending: none"
+	fi
+	exit 0;;
 --check)
 	want=$(image_version "$IMAGE") && [ -n "$want" ] ||
 		die "cannot read the version of $IMAGE"
 	have=$(bar_firmware)
 	case $have in
-	*"TSX-LEDBAR [v$want]"*) echo "bar runs tsx-ledbar $want"; exit 0;;
+	*"TSX-LEDBAR [v$want]"*) drop_stale_pending "$want"; echo "bar runs tsx-ledbar $want"; exit 0;;
 	"")
 		bar_in_bootloader &&
 			die "the LED bar is in bootloader mode. Run tsx-ledbar-fw-install to load the firmware"
@@ -105,15 +181,19 @@ case $1 in
 	echo "LED bar recovered from bootloader mode"
 	exit 0;;
 "") ;;
--*) die "usage: tsx-ledbar-fw-install [FILE.upg | --check | --recover-image | --recover]";;
+-*) die "usage: tsx-ledbar-fw-install [FILE.upg | --check | --status | --recover-image | --recover]";;
 *) IMAGE=$1;;
 esac
 
 [ "$(id -u)" = 0 ] || die "run as root"
 [ -r "$IMAGE" ] || die "image not found: $IMAGE"
+if [ -e "$PENDING" ]; then
+	echo "loading $IMAGE: $(sed -n 's/^new=//p' "$PENDING") (the bar runs $(sed -n 's/^old=//p' "$PENDING"))"
+fi
 "$FLASH" flash "$IMAGE" || die "flash failed, the bar keeps its bootloader: run the install again"
 restart_bar_users
 mkdir -p "$(dirname "$MARKER")"
 date '+%F %T' > "$MARKER"
-echo "tsx-ledbar firmware installed. Package upgrades now update the bar."
-echo "tsx-ledbar-fw-uninstall puts the stock firmware back."
+rm -f "$PENDING"
+echo "tsx-ledbar firmware installed. A package upgrade tells you when a newer image is available."
+echo "Run tsx-ledbar-fw-install again to load it. tsx-ledbar-fw-uninstall puts the stock firmware back."

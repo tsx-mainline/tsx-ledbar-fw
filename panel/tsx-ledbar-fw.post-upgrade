@@ -1,13 +1,12 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
-# apk post-upgrade of tsx-ledbar-fw: when the user installed the tsx-ledbar
-# firmware (marker in /data/tsx), load the new packaged image into the bar.
-# Without the marker the bar keeps its firmware (stock by default).
-MARKER=/data/tsx/ledbar-fw.installed
-[ -e "$MARKER" ] || exit 0
-if tsx-ledbar-fw-install --check >/dev/null 2>&1; then
-	exit 0
-fi
-echo "tsx-ledbar-fw: loading the new bar firmware"
-tsx-ledbar-fw-install || echo "tsx-ledbar-fw: the load failed, run tsx-ledbar-fw-install by hand" >&2
+# apk post-upgrade of tsx-ledbar-fw. It never loads the bar: a load that stops
+# half way can leave a bar that USB cannot recover, and the autoupdate service
+# runs apk upgrade at night with nobody present. When the user installed the
+# tsx-ledbar firmware (marker in /data/tsx) and the new packaged image is not
+# the image of the bar, the hook records the newer image in
+# /data/tsx/ledbar-fw.pending and logs one line. A person runs
+# tsx-ledbar-fw-install to load it. Without the marker the bar keeps its
+# firmware (stock by default) and the hook does nothing.
+tsx-ledbar-fw-install --note-upgrade || true
 exit 0

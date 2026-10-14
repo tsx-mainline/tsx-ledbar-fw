@@ -15,7 +15,12 @@ Do these steps on the panel, as root.
 3. Wait for the command to end. It stops the `tsx-ledbar` service, loads the image, and starts the service again.
 4. Run `tsx-ledbar-fw-install --check`. The command exits with 0 when the bar runs the packaged version.
 
-After this, a package upgrade loads the new image into the bar. The install writes the marker `/data/tsx/ledbar-fw.installed`, and the upgrade script looks for it. The load restarts `tsx-esphome` and `tsx-voice` when they run, because these services read the firmware name (the effect list) only at start. A failed restart does not fail the load.
+A package upgrade never loads the bar. The install writes the marker `/data/tsx/ledbar-fw.installed`. When the marker exists and the bar does not run the packaged version, the upgrade script writes the file `/data/tsx/ledbar-fw.pending` (the version of the bar and the new version) and logs one line. A load that stops half way, for example by a power loss after the erase, can leave a bar that USB cannot recover. The `tsx-autoupdate` service runs `apk upgrade` at night, with nobody present. For this reason a person starts every load of a new image:
+
+1. Run `tsx-ledbar-fw-install --status` to see the bar, the packaged image and the pending load.
+2. Run `tsx-ledbar-fw-install` to load the packaged image. A good load removes the pending file.
+
+The load restarts `tsx-esphome` and `tsx-voice` when they run, because these services read the firmware name (the effect list) only at start. A failed restart does not fail the load.
 
 ## Load an image by hand
 
@@ -29,7 +34,7 @@ The command checks the image first (record checksums and lengths, tag, header, C
 The stock image is Crestron software. It is not in this repo or in a package. The mainline installer keeps a copy on the panel in `/data/tsx/vendor/`.
 
 1. Run `tsx-ledbar-fw-uninstall`. If the stock image is in another place, give its path: `tsx-ledbar-fw-uninstall PATH/statussign_VERSION.upg`.
-2. The command checks the image, loads it, restarts `tsx-esphome` and `tsx-voice` when they run, and removes the marker. Package upgrades then leave the bar alone.
+2. The command checks the image, loads it, restarts `tsx-esphome` and `tsx-voice` when they run, and removes the marker and the pending file. Package upgrades then leave the bar alone.
 
 ## Recover a bar in bootloader mode
 
@@ -51,7 +56,9 @@ A panel that ran `tsx-ledbar-fw-uninstall` has no marker. It gets the stock imag
 
 | Command | Function |
 | --- | --- |
-| `tsx-ledbar-fw-install [FILE.upg]` | Load the packaged image or another image. Write the marker |
+| `tsx-ledbar-fw-install [FILE.upg]` | Load the packaged image or another image. Write the marker. Remove the pending file |
+| `tsx-ledbar-fw-install --status` | Show the packaged image, what the bar runs, the marker and the pending load. It loads nothing |
+| `tsx-ledbar-fw-install --note-upgrade` | For the upgrade script. Write the pending file when the bar does not run the packaged version. It never loads the bar |
 | `tsx-ledbar-fw-install --check` | Exit with 0 when the bar runs the packaged version. Else exit with 1 and tell what the bar runs: another version, bootloader mode, or no bar |
 | `tsx-ledbar-fw-install --recover-image` | Print the image that `--recover` loads. Exit with 3 when there is none |
 | `tsx-ledbar-fw-install --recover` | Load that image into a bar in bootloader mode. Keep the `tsx-ledbar` service running and the marker as it is. `tsx-ledbard` calls it |
@@ -256,7 +263,7 @@ The package `tsx-ledbar-fw` builds the image again from the source of the tag wi
 | `panel/` | The install, uninstall and post-upgrade scripts of the package |
 | `tests/test_upg.py` | Tests of the container tool |
 | `tests/test_flash.py` | Tests of `tsx-ledbar-flash` with a fake bootloader: records, packets, blocks, a bootloader that does not take a packet |
-| `tests/test_panel.py` | Tests of `tsx-ledbar-fw-install --check`, `--recover-image` and `--recover` with a fake sysfs tree, a fake flasher and a fake `rc-service` |
+| `tests/test_panel.py` | Tests of `tsx-ledbar-fw-install` (`--check`, `--status`, `--recover-image`, `--recover`, the load by hand), the upgrade script (no load, the pending file) and the uninstall script, with a fake sysfs tree, a fake flasher and a fake `rc-service` |
 | `tests/test_ledmap.py` | Checks the LED maps in the firmware, in the test and in `docs/leds.md`: the default map, the map `outputs`, the names |
 | `tests/test_fw_host.py` | Builds and runs the C tests in `tests/host/` with the host compiler: firmware files with fake registers (`tests/host/fake/`). The I2C test has a model of the bus and the chips: absent chips, a chip that needs a reset pulse, a late driver supply, SDA held low after a reset pulse or for good, and a shorted reset line |
 | `qemu/run-test.py ELF` | Runs the QEMU build on the netduino2 machine. Checks the console, the LED engine, the start guard, `LEDMAP`, `I2CSCAN`, a bar with a subset of the LED chips, and a start with each variant value. The QEMU build has the command `TEST` for the guard events and a USB time of 20 s. `TEST CHIPS MASK` sets the chips that answer (bit 0 red, bit 1 green, bit 2 blue) and starts the chips again. The QEMU build reads the variant value from RAM, because the machine has no GPIO model |

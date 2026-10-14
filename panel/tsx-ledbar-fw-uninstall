@@ -9,6 +9,7 @@
 #   tsx-ledbar-fw-uninstall [statussign_VERSION.upg]
 STOCK_DIR=${TSX_LEDBAR_STOCK_DIR:-/data/tsx/vendor}
 MARKER=${TSX_LEDBAR_FW_MARKER:-/data/tsx/ledbar-fw.installed}
+PENDING=${TSX_LEDBAR_FW_PENDING:-/data/tsx/ledbar-fw.pending}
 FLASH=${TSX_LEDBAR_FLASH:-tsx-ledbar-flash}
 LIB=${TSX_LEDBAR_FW_LIB:-/usr/local/lib/tsx-ledbar-fw}
 
@@ -40,5 +41,5 @@ fi
 python3 "$LIB"/tsx-upg.py verify "$IMAGE" || die "the image fails its checks, nothing sent"
 "$FLASH" flash "$IMAGE" || die "flash failed, the bar keeps its bootloader: run the uninstall again"
 restart_bar_users
-rm -f "$MARKER"
+rm -f "$MARKER" "$PENDING"
 echo "stock LED bar firmware restored from $IMAGE"
