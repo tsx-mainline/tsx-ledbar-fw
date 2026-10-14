@@ -242,7 +242,7 @@ A tag `vVERSION` makes the workflow `release` build the image and attach it to t
 | `BUILDINFO` | The version, the commit of this repo, the libopencm3 commit, the toolchain versions, the link to the build and the SHA-256 sum of the image |
 | `SHA256SUMS` | The SHA-256 sums of the image and of `BUILDINFO` |
 
-No Crestron file goes into a release. For a tag that exists already, start the workflow `release` by hand and give the tag. This replaces the assets of that release. The workflow `ci` builds the image and runs the tests on each push and pull request.
+No Crestron file goes into a release. For a tag that exists already, start the workflow `release` by hand and give the tag. This replaces the assets of that release. The workflow `ci` builds the image and runs the tests on each push and pull request. The unit tests must pass. The QEMU tests are advisory on GitHub: they measure the ticks of the LED engine in time, and a shared runner can be too slow for them. A QEMU run that fails is repeated up to 3 times, and a failure shows as a warning and does not stop the build. Run `qemu/run-test.py` and `qemu/test-leds.py` on a fast machine before you set a tag.
 
 ### Check an image
 
