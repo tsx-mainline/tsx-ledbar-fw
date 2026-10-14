@@ -8,7 +8,9 @@ first entry is the default map. The map of the TSW-1060-LB is the
 physical order of that bar, top to bottom: the right side is driven by
 outputs 15, 6, 0, 1, 2, 3, 4, 5 and the left side by outputs 14, 13, 12,
 11, 10, 9, 8, 7. Output n of the red, green and blue chip drives the same
-LED.
+LED. The TSW-1070-LB has the same 16 LEDs on other outputs: the right
+side 14, 6, 5, 4, 3, 2, 1, 0 and the left side 15, 13, 12, 11, 10, 9, 8,
+7, top to bottom.
 
 To add a map for a tested bar model: add the entry to ledmaps[], to MAPS
 and to the table of maps in docs/leds.md (section "Board variant and LED
@@ -24,6 +26,7 @@ LEFT = [14, 13, 12, 11, 10, 9, 8, 7]
 # the tested LED bar models: (map name, outputs of LED index 0..15), the default first
 MAPS = [
     ('TSW-1060-LB', RIGHT + LEFT),
+    ('TSW-1070-LB', [14, 6, 5, 4, 3, 2, 1, 0, 15, 13, 12, 11, 10, 9, 8, 7]),
 ]
 DEFAULT = 'TSW-1060-LB'
 KEYWORDS = ('DEFAULT', 'PANEL')

@@ -34,6 +34,7 @@ Machine, leds_in = rt.Machine, rt.leds_in
 
 NAMES = ['R%d' % n for n in range(1, 9)] + ['L%d' % n for n in range(1, 9)]
 OUTPUTS = [15, 6, 0, 1, 2, 3, 4, 5, 14, 13, 12, 11, 10, 9, 8, 7]
+MAP1070 = [14, 6, 5, 4, 3, 2, 1, 0, 15, 13, 12, 11, 10, 9, 8, 7]
 RING = list(range(8)) + list(range(15, 7, -1))  # R1..R8, L8..L1: clockwise from the front
 CIE = [0, 73, 145, 218, 290, 363, 435, 508, 580, 656,
        738, 826, 922, 1024, 1134, 1251, 1376, 1509, 1650, 1800,
@@ -879,6 +880,7 @@ def test_ledmap(m, variant):
           'value %d: L8 blue lights output %d' % (variant, OUTPUTS[15]))
     for arg, outs, what, src in (('outputs', plain, 'outputs', 'console'),
                                  ('TSW-1060-LB PANEL', OUTPUTS, 'TSW-1060-LB', 'panel'),
+                                 ('TSW-1070-LB PANEL', MAP1070, 'TSW-1070-LB', 'panel'),
                                  ('OUTPUTS PANEL', plain, 'outputs', 'panel'),
                                  ('DEFAULT', OUTPUTS, 'TSW-1060-LB', 'default')):
         out = m.cmd('LEDMAP %s' % arg, 0.4)
@@ -889,7 +891,7 @@ def test_ledmap(m, variant):
               'value %d, LEDMAP %s: LED GET outputs, the pattern stays' % (variant, arg))
         check(lit(chip_pwm(m, 'BLUE')) == [outs[15]], 'value %d, LEDMAP %s: L8 moves to output %d at the next tick: %s' % (
             variant, arg, outs[15], lit(chip_pwm(m, 'BLUE'))))
-    for arg, outs in (('outputs', plain), ('TSW-1060-LB PANEL', OUTPUTS)):
+    for arg, outs in (('outputs', plain), ('TSW-1060-LB PANEL', OUTPUTS), ('TSW-1070-LB PANEL', MAP1070)):
         m.cmd('LEDMAP %s' % arg, 0.1)
         m.cmd('FX SPLIT 100 0 0 0 0 100', 0.6)
         check(lit(chip_pwm(m, 'RED')) == sorted(outs[:8]) and lit(chip_pwm(m, 'BLUE')) == sorted(outs[8:]),

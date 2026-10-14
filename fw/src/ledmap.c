@@ -45,6 +45,10 @@ static const struct ledmap ledmaps[] = {
 		15, 6, 0, 1, 2, 3, 4, 5,	/* R1..R8: right side, top to bottom */
 		14, 13, 12, 11, 10, 9, 8, 7,	/* L1..L8: left side, top to bottom */
 	} },
+	{ "TSW-1070-LB", {
+		14, 6, 5, 4, 3, 2, 1, 0,	/* R1..R8: right side, top to bottom */
+		15, 13, 12, 11, 10, 9, 8, 7,	/* L1..L8: left side, top to bottom */
+	} },
 };
 #define NMAPS		(sizeof(ledmaps) / sizeof(ledmaps[0]))
 #define DEFAULT_MAP	(&ledmaps[0])

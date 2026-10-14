@@ -190,13 +190,13 @@ def test_ledmap_console(m):
     check(variant_of(out) == (1, 'TSW-1060-LB', 'default'),
           'STATUS: variant 1 map TSW-1060-LB default: %s' % (variant_of(out),))
     out = m.cmd('LEDMAP')
-    check(variant_of(out) == (1, 'TSW-1060-LB', 'default') and re.search(r'^maps TSW-1060-LB outputs\r?$', out, re.M),
+    check(variant_of(out) == (1, 'TSW-1060-LB', 'default') and re.search(r'^maps TSW-1060-LB TSW-1070-LB outputs\r?$', out, re.M),
           'LEDMAP shows the map line and the maps: %s' % out.strip().replace('\r\n', ' | '))
     out = m.cmd('LEDMAP OUTPUTS')
     check(variant_of(out) == (1, 'outputs', 'console') and 'maps' not in out, 'LEDMAP OUTPUTS: %s' % out.strip())
     check(variant_of(m.cmd('STATUS')) == (1, 'outputs', 'console'), 'STATUS shows the console choice')
     out = m.cmd('LEDMAP 1')
-    check('no LED map 1' in out and 'maps TSW-1060-LB outputs' in out,
+    check('no LED map 1' in out and 'maps TSW-1060-LB TSW-1070-LB outputs' in out,
           'LEDMAP 1: no selection by the variant value, the list: %s' % out.strip().replace('\r\n', ' | '))
     check(variant_of(m.cmd('STATUS')) == (1, 'outputs', 'console'), 'a refused LEDMAP keeps the map')
     for arg in ('9', 'XYZ', 'AUTO', 'TSW-1060', 'PANEL'):
@@ -206,6 +206,8 @@ def test_ledmap_console(m):
     check(variant_of(m.cmd('STATUS')) == (1, 'outputs', 'console'), 'refused forms keep the map')
     out = m.cmd('LEDMAP TSW-1060-LB PANEL')
     check(variant_of(out) == (1, 'TSW-1060-LB', 'panel'), 'LEDMAP TSW-1060-LB PANEL: %s' % out.strip())
+    out = m.cmd('LEDMAP TSW-1070-LB PANEL')
+    check(variant_of(out) == (1, 'TSW-1070-LB', 'panel'), 'LEDMAP TSW-1070-LB PANEL: %s' % out.strip())
     out = m.cmd('ledmap tsw-1060-lb')
     check(variant_of(out) == (1, 'TSW-1060-LB', 'console'), 'ledmap tsw-1060-lb, not case-sensitive: %s' % out.strip())
     out = m.cmd('LEDMAP DEFAULT')

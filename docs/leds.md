@@ -59,6 +59,7 @@ use. The firmware has these maps:
 | Map | Use | Tested |
 | --- | --- | --- |
 | `TSW-1060-LB` | The TSW-1060-LB. This is the default map | yes |
+| `TSW-1070-LB` | The TSW-1070-LB | yes |
 | `outputs` | LED index n is output n. Use it to find the map of another bar model | no |
 
 The firmware selects the map in this order:

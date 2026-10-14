@@ -15,6 +15,7 @@
 #include "tsx.h"
 
 static const uint8_t map1060[NLEDS] = { 15, 6, 0, 1, 2, 3, 4, 5, 14, 13, 12, 11, 10, 9, 8, 7 };
+static const uint8_t map1070[NLEDS] = { 14, 6, 5, 4, 3, 2, 1, 0, 15, 13, 12, 11, 10, 9, 8, 7 };
 static const uint8_t plain[NLEDS] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
 
 static uint16_t idr;		/* input data register of port B */
@@ -123,6 +124,8 @@ int main(void)
 	      "LEDMAP outputs: LED index n is output n, source console");
 	CHECK(ledmap("LEDMAP TSW-1060-LB PANEL") == LEDMAP_DONE && now("TSW-1060-LB", map1060, "panel"),
 	      "LEDMAP TSW-1060-LB PANEL: source panel");
+	CHECK(ledmap("LEDMAP TSW-1070-LB PANEL") == LEDMAP_DONE && now("TSW-1070-LB", map1070, "panel"),
+	      "LEDMAP TSW-1070-LB PANEL: the map of the TSW-1070-LB, source panel");
 	CHECK(ledmap("LEDMAP OUTPUTS panel") == LEDMAP_DONE && now("outputs", plain, "panel"),
 	      "the map name and PANEL are not case-sensitive");
 	CHECK(ledmap("LEDMAP tsw-1060-lb") == LEDMAP_DONE && now("TSW-1060-LB", map1060, "console"),
