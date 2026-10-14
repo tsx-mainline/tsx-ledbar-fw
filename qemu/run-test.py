@@ -17,9 +17,9 @@ value.
 """
 import os
 import re
-import select
 import subprocess
 import sys
+import threading
 import time
 
 QEMU = os.environ.get('QEMU', 'qemu-system-arm')
@@ -43,23 +43,37 @@ class Machine:
         if variant is not None:
             cmd += ['-device', 'loader,addr=0x%08x,data=0x%08x,data-len=4' % (VARIANT_ADDR, VARIANT_MAGIC | variant)]
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        self.buf = b''
+        # A thread reads the console all the time. A test that parses a large
+        # trace must not stop the reader: a full pipe stops QEMU, and the
+        # firmware then misses its ticks.
+        self.buf = bytearray()
+        self.eof = False
+        self.lock = threading.Lock()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        fd = self.p.stdout.fileno()
+        while True:
+            try:
+                d = os.read(fd, 65536)
+            except OSError:
+                d = b''
+            if not d:
+                self.eof = True
+                return
+            with self.lock:
+                self.buf += d
 
     def read_for(self, s):
         end = time.monotonic() + s
-        while True:
+        while not self.eof:
             left = end - time.monotonic()
             if left <= 0:
                 break
-            r, _, _ = select.select([self.p.stdout], [], [], left)
-            if not r:
-                break
-            d = os.read(self.p.stdout.fileno(), 4096)
-            if not d:
-                break
-            self.buf += d
-        out = self.buf.decode('latin-1')
-        self.buf = b''
+            time.sleep(min(left, 0.01))
+        with self.lock:
+            out = bytes(self.buf).decode('latin-1')
+            self.buf.clear()
         return out
 
     def wait_for(self, pattern, timeout=10):
