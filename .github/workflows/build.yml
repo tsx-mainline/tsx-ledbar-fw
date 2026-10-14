@@ -51,6 +51,10 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
+      # The checkout action sets this only for its own steps.
+      - name: trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: toolchain versions
         id: tools
         run: |
