@@ -101,12 +101,26 @@ A bootloader can also refuse the prepare packet: the USB write times out after 2
 
 ## Application side
 
+The way into the USB update mode depends on the version of the stock
+application:
+
+| Stock version | USB update mode ("UPG") | UART monitor ("UPE") |
+| --- | --- | --- |
+| v1.3443.00018 | prepare packet `02 02 04 04` on interface 1 | console command `IMGUPD` |
+| v1.3443.00016 | console command `IMGUPD` | prepare packet `02 02 04 04` on interface 1 |
+
+`tsx-ledbar-flash` reads the firmware name (USB string 4) and sends
+`IMGUPD` to v1.3443.00016. It sends the prepare packet to all other
+versions and to TSX-LEDBAR. After `IMGUPD`, v1.3443.00016 restarts only
+after the host reads the answer of the command. The tool reads it. Other
+stock versions are not tested.
+
 The stock application acts on the prepare packet only. It does not answer it. A replacement application must do the same: write "UPG" into the mailbox at 0x200000F4 and reset. The bootloader then enumerates as 14be:001a and runs the sequence above.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| No answer on USB after `IMGUPD` of the stock application | `IMGUPD` of the stock application writes "UPE". That selects a text monitor on a UART of the bar, which does not answer on USB | Do not use it for a USB update. Run `tsx-ledbar-flash port-reset`. This resets the USB bus of the port and does not cut the power of the bar |
+| No answer on USB after `IMGUPD` of the stock application v1.3443.00018, or after the prepare packet to v1.3443.00016 | The application writes "UPE". That selects a text monitor on a UART of the bar, which does not answer on USB. The bootloader enumerates and answers control requests, but it sends no ready packet and does not take bulk packets | Unplug the LED bar and plug it in again. The bar then starts its application, because the load erased nothing. Then use the other command (see "Application side"). `tsx-ledbar-flash port-reset` can also help, but it is not a sure power cut |
 | The load stops before the end | The bootloader keeps an image only when its CRC is good | Run the load again. The bar stays in the bootloader |
 | `no ready packet from the bootloader` or `the bootloader takes no packets` | The bootloader sends no ready packet, also after the prepare packet, or it refuses the prepare packet (see "The ready packet") | Unplug the LED bar and plug it in again. Or run the load again |

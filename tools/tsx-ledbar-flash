@@ -341,19 +341,41 @@ def send_io_packet(bar, pkt):
     return 'usbdevfs interface 1'
 
 
+# Stock application versions whose console command IMGUPD selects the USB
+# update mode of the bootloader (mailbox "UPG"). On these versions the
+# prepare packet selects the UART monitor, which is silent on USB. Found on
+# a TSW-1070-LB with v1.3443.00016. On v1.3443.00018 it is the other way
+# round: IMGUPD selects the monitor and the prepare packet the USB mode.
+IMGUPD_ENTRY = ('TSW-XX60-LB [v1.3443.00016,',)
+
+
+def entry_method(fw):
+    """'imgupd' or 'prepare': how this application enters the USB update mode"""
+    return 'imgupd' if any(fw.startswith(v) for v in IMGUPD_ENTRY) else 'prepare'
+
+
 def enter_bootloader(bar, service):
     service.stop()
+    how = None
     bar.open(0)
     try:
-        log('bar %s in application mode, firmware "%s"' % (bar.sysname, bar.string(4)))
+        fw = bar.string(4)
+        log('bar %s in application mode, firmware "%s"' % (bar.sysname, fw))
+        if entry_method(fw) == 'imgupd':
+            # the application resets after the host reads the answer
+            show_text(bar.command('IMGUPD', 1500), '  imgupd: ')
+            how = 'console IMGUPD: on this stock version IMGUPD selects the USB update mode'
+            log('sent IMGUPD on the console (%s)' % how)
     finally:
         bar.close()
-    how = send_io_packet(bar, PKT_PREPARE)
-    log('sent the prepare packet %s (%s)' % (PKT_PREPARE.hex(' '), how))
+    if how is None:
+        how = send_io_packet(bar, PKT_PREPARE)
+        log('sent the prepare packet %s (%s)' % (PKT_PREPARE.hex(' '), how))
     gone = wait_for(lambda b: b.sysname != bar.sysname or b.devnode != bar.devnode or not b.is_app,
-                    15, 'the bar to restart')
+                    30, 'the bar to restart')
     if gone is None:
-        die('the bar did not restart after the prepare packet')
+        die('the bar did not restart after the %s' % (
+            'IMGUPD command' if how.startswith('console') else 'prepare packet'))
     return wait_for(lambda b: not b.is_app, 20, 'the bootloader')
 
 

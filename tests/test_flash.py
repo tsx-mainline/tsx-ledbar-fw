@@ -452,6 +452,47 @@ class Fallback(unittest.TestCase):
         self.assertIn('rc-service tsx-ledbar start', out)
 
 
+class Entry(unittest.TestCase):
+    """The way into the USB update mode depends on the stock version:
+    IMGUPD on v1.3443.00016, the prepare packet on the others."""
+
+    def run_entry(self, fw):
+        bar = FakeConsoleBar({'VER': fw, 'IMGUPD': 'TSW-XX60-LB>'})
+        btl = FakeAppBar()
+        btl.pid, btl.is_app, btl.sysname = '001a', False, '1-1'
+        btl.devnode = '/dev/bus/usb/001/003'
+        sent = []
+        out = io.StringIO()
+        with mock.patch.object(flash, 'send_io_packet', lambda b, p: sent.append(p) or 'usbdevfs interface 1'), \
+                mock.patch.object(flash, 'wait_for', lambda pred, t, what: btl if pred(btl) else None), \
+                contextlib.redirect_stdout(out):
+            got = flash.enter_bootloader(bar, FakeService(False))
+        return got, bar.sent, sent, out.getvalue()
+
+    def test_00016_uses_imgupd(self):
+        got, console, packets, out = self.run_entry('TSW-XX60-LB [v1.3443.00016, #FFFFFFFF]')
+        self.assertEqual(got.pid, '001a')
+        self.assertEqual(console, ['IMGUPD'])
+        self.assertEqual(packets, [])
+        self.assertIn('IMGUPD selects the USB update mode', out)
+
+    def test_00018_uses_the_prepare_packet(self):
+        got, console, packets, out = self.run_entry('TSW-XX60-LB [v1.3443.00018, #FFFFFFFF]')
+        self.assertEqual(console, [])
+        self.assertEqual(packets, [flash.PKT_PREPARE])
+
+    def test_our_firmware_uses_the_prepare_packet(self):
+        got, console, packets, out = self.run_entry('TSX-LEDBAR [v0.1.6]')
+        self.assertEqual(console, [])
+        self.assertEqual(packets, [flash.PKT_PREPARE])
+
+    def test_entry_method(self):
+        self.assertEqual(flash.entry_method('TSW-XX60-LB [v1.3443.00016, #FFFFFFFF]'), 'imgupd')
+        self.assertEqual(flash.entry_method('TSW-XX60-LB [v1.3443.000160, #FFFFFFFF]'), 'prepare')
+        self.assertEqual(flash.entry_method('TSW-XX60-LB [v1.3443.00018, #FFFFFFFF]'), 'prepare')
+        self.assertEqual(flash.entry_method(''), 'prepare')
+
+
 class Info(unittest.TestCase):
     def run_info(self, answers):
         bar = FakeConsoleBar(answers)
